@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Assemble a weights bundle from a declarative spec.
+"""Assemble a weights or dataset bundle from a declarative spec.
 
-A bundle is a directory of weight and config files plus a checksummed
+A bundle is a directory of weight, config or data files plus a checksummed
 MANIFEST.json, ready to `oras push`. What goes in is defined entirely by a small
 JSON spec — nothing about the file set is hard-coded here, and this tool has no
 git awareness.
@@ -13,8 +13,11 @@ Spec format:
     {
       "name": "biom3-weights-run1_base",
       "weights": { "<dest under weights/>": "<source path>", ... },
-      "configs": { "<dest under configs/>": "<source path>", ... }
+      "configs": { "<dest under configs/>": "<source path>", ... },
+      "data":    { "<dest under data/>": "<source path>", ... }
     }
+
+Every section is optional; a dataset bundle has only "data".
 
 Source paths are used as-is if absolute, else resolved against the current
 working directory (run from the repo root). A weight source that is a `.ckpt`
@@ -53,8 +56,8 @@ def copy_file(src, dst):
     shutil.copyfile(src, dst)
 
 
-def add_entry(src, dst):
-    if os.path.isdir(src) or src.endswith(".ckpt"):
+def add_entry(top, src, dst):
+    if top == "weights" and (os.path.isdir(src) or src.endswith(".ckpt")):
         flatten_checkpoint(src, dst)
     else:
         copy_file(src, dst)
@@ -84,12 +87,13 @@ def main(argv=None):
     entries = (
         [("weights", d, s) for d, s in spec.get("weights", {}).items()]
         + [("configs", d, s) for d, s in spec.get("configs", {}).items()]
+        + [("data", d, s) for d, s in spec.get("data", {}).items()]
     )
     for top, dest, src in entries:
         src_abs = src if os.path.isabs(src) else os.path.abspath(src)
         if not os.path.exists(src_abs):
             sys.exit(f"missing source for {top}/{dest}: {src_abs}")
-        add_entry(src_abs, os.path.join(bundle_dir, top, dest))
+        add_entry(top, src_abs, os.path.join(bundle_dir, top, dest))
         print(f"  {top}/{dest}  <-  {src}")
 
     files = []
@@ -113,7 +117,9 @@ def main(argv=None):
     total = sum(r["bytes"] for r in files)
     print(f"\n{name}: {len(files)} files, {total / 1e9:.3f} GB")
     print(f"  {bundle_dir}")
-    print(f"  push:  scripts/weights_bundle/push_bundle.sh {bundle_dir} <tag>")
+    kind = "dataset" if spec.get("data") else "weights"
+    print(f"  push:  scripts/weights_bundle/push_bundle.sh {bundle_dir} <tag> "
+          f"--repo <repo> --kind {kind}")
     return 0
 
 

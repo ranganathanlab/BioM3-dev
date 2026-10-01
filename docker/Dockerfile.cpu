@@ -62,11 +62,6 @@ WORKDIR /app
 COPY requirements/ /app/requirements/
 RUN pip install -r requirements/container-cpu.txt
 
-# Optional: bake awscli in for the entrypoint's S3 sync hook (see the cuda
-# variant). Off by default; bind-mounts and the GHCR bundle need no cloud tools.
-ARG INSTALL_AWSCLI=false
-RUN if [ "$INSTALL_AWSCLI" = "true" ]; then pip install awscli; fi
-
 # BioM3 source. Explicit paths (no `COPY . .`) so weights/, data/, outputs/,
 # logs/ and jobs/ are never baked in. No `[app]` extra here — streamlit,
 # py3Dmol and imageio-ffmpeg are ~110 MB and biom3_app is served by the cuda

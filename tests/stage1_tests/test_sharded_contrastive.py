@@ -6,10 +6,14 @@ otherwise switching to sharded silently changes the objective.
 
 Runs on CPU with tiny tensors -- no distributed, no XPU.
 """
+import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from biom3.Stage1.model import pfam_PEN_CL
+
+pytestmark = pytest.mark.usefixtures("no_process_group")
 
 
 class _Stub(pfam_PEN_CL):
@@ -130,6 +134,98 @@ def test_sharded_matches_dense():
         assert pr_a < TOL, f"W={W} B={B}: per-rank intra mismatch {pr_a}"
         assert gl_i < TOL, f"W={W} B={B}: global inter mismatch {gl_i}"
         assert gl_a < TOL, f"W={W} B={B}: global intra mismatch {gl_a}"
+
+
+def _naive_unif(z, N, t):
+    """log mean exp(-t ||x_i - x_j||^2) over i != j, homolog pairs (i, i+-N) excluded."""
+    x = F.normalize(z, dim=1)
+    M = x.shape[0]
+    d2 = torch.cdist(x, x).pow(2)
+    valid = ~torch.eye(M, dtype=torch.bool)
+    i = torch.arange(M)
+    valid[i, (i + N) % M] = False
+    return torch.log(torch.exp(-t * d2[valid]).mean())
+
+
+def _rank_rows(W, B):
+    N = W * B
+    return [torch.cat([torch.arange(r * B, (r + 1) * B),
+                       torch.arange(N + r * B, N + (r + 1) * B)]) for r in range(W)]
+
+
+def test_uniformity_dense_matches_naive():
+    torch.manual_seed(0)
+    m = _Stub(0.8)
+    for W, B, t in ((1, 4, 2.0), (3, 5, 2.0), (4, 2, 0.5)):
+        N = W * B
+        z = torch.randn(2 * N, 16) * 7 + 3   # unnormalized, offset, like LayerNorm output
+        d = abs(m.compute_uniformity_loss(z, t).item() - _naive_unif(z, N, t).item())
+        assert d < 1e-5, f"W={W} B={B} t={t}: {d}"
+
+
+def test_uniformity_sharded_matches_dense():
+    m = _Stub(0.8)
+    for W, B in ((1, 4), (2, 3), (4, 2), (3, 5)):
+        torch.manual_seed(W * 10 + B)
+        z = torch.randn(2 * W * B, 16, requires_grad=True)
+
+        def dense():
+            return m.compute_uniformity_loss(z, 2.0)
+
+        def sharded():
+            lse = torch.cat([m.uniformity_row_logsumexp(z, ri, 2.0)
+                             for ri in _rank_rows(W, B)])
+            return m.uniformity_from_row_logsumexp(lse, 2.0)
+
+        assert abs(dense().item() - sharded().item()) < 1e-5
+        g_d, = _grads(dense, z)
+        g_s, = _grads(sharded, z)
+        assert (g_d - g_s).abs().max().item() < 1e-5, f"W={W} B={B}: gradient mismatch"
+
+
+def test_uniformity_orders_collapsed_below_spread():
+    torch.manual_seed(0)
+    m = _Stub(0.8)
+    spread = torch.randn(64, 256)
+    collapsed = torch.randn(1, 256) + 0.05 * torch.randn(64, 256)
+    l_spread = m.compute_uniformity_loss(spread).item()
+    assert abs(l_spread - (-4.0)) < 0.1          # near the -2t floor in high dim
+    assert m.compute_uniformity_loss(collapsed).item() > l_spread + 3.0
+
+
+def test_uniformity_wrapper_helper_single_process():
+    from argparse import Namespace
+    from biom3.Stage1.PL_wrapper import _uniformity_losses, _gather_with_grad
+    torch.manual_seed(0)
+    m = _Stub(0.8)
+    B = 4
+    z_p, z_t = torch.randn(2 * B, 16), torch.randn(2 * B, 16)
+    args = Namespace(uniformity_t=2.0, uniformity_on='both')
+    dense = _uniformity_losses(m, args, z_p, z_t, B, 'dense', _gather_with_grad)
+    sharded = _uniformity_losses(m, args, z_p, z_t, B, 'sharded', _gather_with_grad)
+    assert set(dense) == {'protein', 'text'}
+    for k in dense:
+        assert abs(dense[k].item() - sharded[k].item()) < 1e-5
+    args.uniformity_on = 'protein'
+    assert set(_uniformity_losses(m, args, z_p, z_t, B, 'dense', _gather_with_grad)) == {'protein'}
+
+
+def test_uniformity_skipped_for_a_single_pair():
+    """M = 2 leaves no pair after the self/homolog exclusion, so L_unif is NaN;
+    the term must be skipped, not added to the loss."""
+    from argparse import Namespace
+    from types import SimpleNamespace
+    from biom3.Stage1.PL_wrapper import pfam_PL_PEN_CL
+    host = SimpleNamespace(model=_Stub(0.8), script_args=Namespace(
+        uniformity_weight=0.5, uniformity_t=2.0, uniformity_on='both'))
+    loss = torch.tensor(1.0)
+    for impl in ('dense', 'sharded'):
+        out, logged = pfam_PL_PEN_CL._add_uniformity(
+            host, loss, torch.randn(2, 16), torch.randn(2, 16), 1, impl, 'train')
+        assert out is loss and logged == {}, impl
+        out, logged = pfam_PL_PEN_CL._add_uniformity(
+            host, loss, torch.randn(4, 16), torch.randn(4, 16), 2, impl, 'train')
+        assert torch.isfinite(out) and len(logged) == 2, impl
 
 
 if __name__ == "__main__":

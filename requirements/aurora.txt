@@ -4,3 +4,5 @@ imageio
 fair-esm
 axial_positional_embedding
 linear_attention_transformer
+wandb==0.24.1
+h5py

@@ -71,6 +71,7 @@ from torch.utils.data import DataLoader
 
 # ----- Retrieve available device -----
 from biom3.backend.device import BACKEND_NAME, _XPU, setup_logger, set_float32_matmul_precision
+from biom3.backend.device import DEVICE_CHOICES, resolve_device, check_devices_per_node
 
 # Import pytorch lightning based on device
 if BACKEND_NAME == _XPU:
@@ -205,9 +206,10 @@ def get_args(parser):
                         help='path to checkpoint directory')
     parser.add_argument('--checkpoint_prefix', default='channels',
                         help='prefix for local checkpoint')
-    parser.add_argument('--device', default='cuda', type=str, 
-                        choices=["cpu", "cuda", "xpu"],
-                        help='computational device')
+    parser.add_argument('--device', default='auto', type=str,
+                        choices=list(DEVICE_CHOICES),
+                        help='computational device; auto = the detected GPU '
+                             'backend (CUDA, then XPU; never falls back to CPU)')
     parser.add_argument('--model_option', default='transformer', type=str,
                         choices=['Unet', 'transformer'],
                         help='Choose model architecture')
@@ -1925,6 +1927,13 @@ def main(args, use_hydra=False, ds_config=None,):
     logging.getLogger("tensorboardX.x2num").setLevel(logging.ERROR)
 
     # ----- Dry-run preview (no training executed) -----
+    # A dry run only probes config, data and model, so it may land on CPU; a
+    # real run must find a GPU unless --device cpu was asked for explicitly.
+    dry_run = getattr(args, 'dry_run', False)
+    args.device = resolve_device(args.device, allow_cpu=dry_run)
+    if not dry_run:
+        check_devices_per_node(args.device, args.devices_per_node)
+
     if getattr(args, 'dry_run', False):
         return run_dry_run(
             args,
@@ -1945,157 +1954,156 @@ def main(args, use_hydra=False, ds_config=None,):
         os.makedirs(artifacts_dir, exist_ok=True)
         os.makedirs(checkpoint_dir, exist_ok=True)
     log_path, file_handler = setup_file_logging(artifacts_dir)
-
-    # ----- Process passed parameters -----
-    seed = args.seed
-    primary_data_path = args.primary_data_path
-    secondary_data_paths = args.secondary_data_paths
-    facilitator = args.facilitator
-
-    # ----- Clear the GPU cache -----
-    set_float32_matmul_precision(args.float32_matmul_precision)
-    clear_gpu_cache()
-
-    # ----- For reproducibility -----
-    if seed <= 0:
-        seed = np.random.randint(2**32)
-        args.seed = seed
-    set_seed(seed)
-    logger.info("Using seed: %s", seed)
-
-    # ----- Load Data -----
-    data_module = load_data(
-        args=args,
-        primary_data_path=primary_data_path,
-        secondary_data_paths=secondary_data_paths,
-        facilitator=facilitator,
-    )
-
-    # ----- Load Model -----
-    PL_model = load_model(
-        args=args,
-        data_module=data_module
-    )
-
-    # ----- Load pretrained weights and freeze if finetuning -----
-    finetuning = args.finetune
-    if finetuning:
-        finetune_last_n_blocks = args.finetune_last_n_blocks
-        finetune_last_n_layers = args.finetune_last_n_layers
-        finetune_output_layers = args.finetune_output_layers
-        pretrained_weights = args.pretrained_weights
-        resume_from_checkpoint = args.resume_from_checkpoint
-        if finetune_last_n_layers == -2:
-            # If flag is set to finetune and layers not specified (default -2)
-            # set to -1 (all layers trainable)
-            finetune_last_n_layers = -1
-        if finetune_last_n_blocks == -2:
-            # If flag is set to finetune and blocks not specified (default -2)
-            # set to -1 (all blocks trainable)
-            finetune_last_n_blocks = -1
-        # When resuming, weights (and optimizer state) are restored from the
-        # Lightning checkpoint by trainer.fit(ckpt_path=...), so loading
-        # pretrained_weights would be wasted work and misleading. Still apply
-        # the freeze logic, since requires_grad flags are not persisted in
-        # Lightning checkpoints.
-        skip_pretrained = resume_from_checkpoint is not None
-        if skip_pretrained and pretrained_weights is not None:
-            # NOTE: the exact string "Ignoring --pretrained_weights" is
-            # asserted by test_resume_finetune_ignores_pretrained_weights in
-            # tests/stage3_tests/test_stage3_run_PL_training.py. Changing it
-            # will break that regression test.
-            logger.info(
-                "Ignoring --pretrained_weights (%s) because "
-                "--resume_from_checkpoint (%s) is set; weights will be "
-                "restored from the checkpoint.",
-                pretrained_weights, resume_from_checkpoint,
-            )
-        if skip_pretrained:
-            PL_model = freeze_except_last_n_blocks_and_layers(
-                PL_model=PL_model,
-                n_blocks=finetune_last_n_blocks,
-                n_layers=finetune_last_n_layers,
-                finetune_output_layers=finetune_output_layers
-            )
-        elif pretrained_weights is None:
-            logger.warning("Finetuning flag --finetune set to True but "
-                           "pretrained_weights path not specified.")
-            logger.warning("Proceeding with loaded weights")
-        elif os.path.exists(pretrained_weights):
-            PL_model = load_pretrained_weights(
-                PL_model=PL_model,
-                checkpoint_path=pretrained_weights
-            )
-            # Freeze parameters based on user configuration
-            PL_model = freeze_except_last_n_blocks_and_layers(
-                PL_model=PL_model,
-                n_blocks=finetune_last_n_blocks,
-                n_layers=finetune_last_n_layers,
-                finetune_output_layers=finetune_output_layers
-            )
-        else:
-            logger.warning("Pretrained checkpoint not found at %s", pretrained_weights)
-            logger.warning("Proceeding with randomly initialized weights")
-    else:
-        pass
-
-    # ----- Write build manifest before training (rank 0 only) -----
-    _write_build_manifest(
-        args=args,
-        artifacts_dir=artifacts_dir,
-        checkpoint_dir=checkpoint_dir,
-        PL_model=PL_model,
-        start_time=start_time,
-    )
-
-    # ----- Train Model -----
-    exit_reason = "completed"
-    exception = None
     try:
-        train_model(
-            args=args,
-            PL_model=PL_model,
-            data_module=data_module,
-            ds_config=ds_config,
-        )
-    except KeyboardInterrupt as e:
-        exit_reason = "interrupted"
-        exception = e
-        raise
-    except BaseException as e:
-        exit_reason = "exception"
-        exception = e
-        raise
-    finally:
-        time_limit_seconds = getattr(args, 'time_limit_seconds', None)
-        if exit_reason == "completed" and time_limit_seconds is not None:
-            elapsed = time.perf_counter() - _MAIN_START_MONOTONIC
-            if elapsed >= time_limit_seconds:
-                exit_reason = "time_limit_exceeded"
-        completed_epochs = (
-            _LAST_TRAINER.current_epoch if _LAST_TRAINER is not None else None
-        )
-        completed_steps = (
-            _LAST_TRAINER.global_step if _LAST_TRAINER is not None else None
-        )
-        _write_run_summary(
-            artifacts_dir=artifacts_dir,
-            start_time=start_time,
-            exit_reason=exit_reason,
-            exception=exception,
-            completed_epochs=completed_epochs,
-            completed_steps=completed_steps,
-        )
-        if _MAIN_START_MONOTONIC is not None:
-            total = int(time.perf_counter() - _MAIN_START_MONOTONIC)
-            h, rem = divmod(total, 3600)
-            m, s = divmod(rem, 60)
-            logger.info(
-                "Program exiting. Total elapsed time: %d:%02d:%02d", h, m, s,
-            )
+        # ----- Process passed parameters -----
+        seed = args.seed
+        primary_data_path = args.primary_data_path
+        secondary_data_paths = args.secondary_data_paths
+        facilitator = args.facilitator
 
-    # ----- Clean up -----
-    teardown_file_logging("biom3", file_handler)
+        # ----- Clear the GPU cache -----
+        set_float32_matmul_precision(args.float32_matmul_precision)
+        clear_gpu_cache()
+
+        # ----- For reproducibility -----
+        if seed <= 0:
+            seed = np.random.randint(2**32)
+            args.seed = seed
+        set_seed(seed)
+        logger.info("Using seed: %s", seed)
+
+        # ----- Load Data -----
+        data_module = load_data(
+            args=args,
+            primary_data_path=primary_data_path,
+            secondary_data_paths=secondary_data_paths,
+            facilitator=facilitator,
+        )
+
+        # ----- Load Model -----
+        PL_model = load_model(
+            args=args,
+            data_module=data_module
+        )
+
+        # ----- Load pretrained weights and freeze if finetuning -----
+        finetuning = args.finetune
+        if finetuning:
+            finetune_last_n_blocks = args.finetune_last_n_blocks
+            finetune_last_n_layers = args.finetune_last_n_layers
+            finetune_output_layers = args.finetune_output_layers
+            pretrained_weights = args.pretrained_weights
+            resume_from_checkpoint = args.resume_from_checkpoint
+            if finetune_last_n_layers == -2:
+                # If flag is set to finetune and layers not specified (default -2)
+                # set to -1 (all layers trainable)
+                finetune_last_n_layers = -1
+            if finetune_last_n_blocks == -2:
+                # If flag is set to finetune and blocks not specified (default -2)
+                # set to -1 (all blocks trainable)
+                finetune_last_n_blocks = -1
+            # When resuming, weights (and optimizer state) are restored from the
+            # Lightning checkpoint by trainer.fit(ckpt_path=...), so loading
+            # pretrained_weights would be wasted work and misleading. Still apply
+            # the freeze logic, since requires_grad flags are not persisted in
+            # Lightning checkpoints.
+            skip_pretrained = resume_from_checkpoint is not None
+            if skip_pretrained and pretrained_weights is not None:
+                # NOTE: the exact string "Ignoring --pretrained_weights" is
+                # asserted by test_resume_finetune_ignores_pretrained_weights in
+                # tests/stage3_tests/test_stage3_run_PL_training.py. Changing it
+                # will break that regression test.
+                logger.info(
+                    "Ignoring --pretrained_weights (%s) because "
+                    "--resume_from_checkpoint (%s) is set; weights will be "
+                    "restored from the checkpoint.",
+                    pretrained_weights, resume_from_checkpoint,
+                )
+            if skip_pretrained:
+                PL_model = freeze_except_last_n_blocks_and_layers(
+                    PL_model=PL_model,
+                    n_blocks=finetune_last_n_blocks,
+                    n_layers=finetune_last_n_layers,
+                    finetune_output_layers=finetune_output_layers
+                )
+            elif pretrained_weights is None:
+                logger.warning("Finetuning flag --finetune set to True but "
+                               "pretrained_weights path not specified.")
+                logger.warning("Proceeding with loaded weights")
+            elif os.path.exists(pretrained_weights):
+                PL_model = load_pretrained_weights(
+                    PL_model=PL_model,
+                    checkpoint_path=pretrained_weights
+                )
+                # Freeze parameters based on user configuration
+                PL_model = freeze_except_last_n_blocks_and_layers(
+                    PL_model=PL_model,
+                    n_blocks=finetune_last_n_blocks,
+                    n_layers=finetune_last_n_layers,
+                    finetune_output_layers=finetune_output_layers
+                )
+            else:
+                logger.warning("Pretrained checkpoint not found at %s", pretrained_weights)
+                logger.warning("Proceeding with randomly initialized weights")
+        else:
+            pass
+
+        # ----- Write build manifest before training (rank 0 only) -----
+        _write_build_manifest(
+            args=args,
+            artifacts_dir=artifacts_dir,
+            checkpoint_dir=checkpoint_dir,
+            PL_model=PL_model,
+            start_time=start_time,
+        )
+
+        # ----- Train Model -----
+        exit_reason = "completed"
+        exception = None
+        try:
+            train_model(
+                args=args,
+                PL_model=PL_model,
+                data_module=data_module,
+                ds_config=ds_config,
+            )
+        except KeyboardInterrupt as e:
+            exit_reason = "interrupted"
+            exception = e
+            raise
+        except BaseException as e:
+            exit_reason = "exception"
+            exception = e
+            raise
+        finally:
+            time_limit_seconds = getattr(args, 'time_limit_seconds', None)
+            if exit_reason == "completed" and time_limit_seconds is not None:
+                elapsed = time.perf_counter() - _MAIN_START_MONOTONIC
+                if elapsed >= time_limit_seconds:
+                    exit_reason = "time_limit_exceeded"
+            completed_epochs = (
+                _LAST_TRAINER.current_epoch if _LAST_TRAINER is not None else None
+            )
+            completed_steps = (
+                _LAST_TRAINER.global_step if _LAST_TRAINER is not None else None
+            )
+            _write_run_summary(
+                artifacts_dir=artifacts_dir,
+                start_time=start_time,
+                exit_reason=exit_reason,
+                exception=exception,
+                completed_epochs=completed_epochs,
+                completed_steps=completed_steps,
+            )
+            if _MAIN_START_MONOTONIC is not None:
+                total = int(time.perf_counter() - _MAIN_START_MONOTONIC)
+                h, rem = divmod(total, 3600)
+                m, s = divmod(rem, 60)
+                logger.info(
+                    "Program exiting. Total elapsed time: %d:%02d:%02d", h, m, s,
+                )
+    finally:
+        teardown_file_logging("biom3", file_handler)
 
 
 def _stage3_dataset_probe(args):

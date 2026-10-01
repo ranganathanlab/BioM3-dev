@@ -89,9 +89,9 @@ elif [[ "$BIOM3_MACHINE" == spark ]]; then
     : # No Spark-specific exports currently.
 
 elif [[ "$BIOM3_MACHINE" == container ]]; then
-    # --- Containerized commercial cloud (AWS / Mithril) — NVIDIA GPU(s).
-    # Single-node only; torchrun handles multi-GPU rendezvous and sets a safe
-    # OMP_NUM_THREADS itself (see scripts/launchers/container_singlenode.sh).
+    # --- Docker container — NVIDIA GPU(s). torchrun handles multi-GPU and
+    # multi-node rendezvous and sets a safe OMP_NUM_THREADS itself (see
+    # scripts/launchers/container_{singlenode,multinode}.sh).
     # No HPC/MPI/PBS/CPU-binding settings apply here.
     : # No container-specific exports currently needed.
 

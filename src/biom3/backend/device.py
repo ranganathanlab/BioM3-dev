@@ -36,6 +36,65 @@ def get_device():
     return torch.device(BACKEND_NAME)
 
 
+DEVICE_CHOICES = ("auto", _CPU, _CUDA, _XPU)
+
+
+def resolve_device(requested, *, allow_cpu: bool = True) -> str:
+    """Resolve a ``--device`` value to a concrete device type.
+
+    ``"auto"`` (or ``None``) becomes the detected backend: CUDA, then XPU,
+    then CPU. With ``allow_cpu=False`` an automatic fallback to CPU raises
+    instead, so a training run never lands on CPU by accident; an explicit
+    ``"cpu"`` is always honoured.
+    """
+    if requested not in (None, "auto"):
+        return requested
+    if BACKEND_NAME == _CPU and not allow_cpu:
+        raise RuntimeError(
+            "--device auto found no GPU backend (neither CUDA nor XPU is "
+            "available to torch). Pass --device cpu to run on CPU deliberately."
+        )
+    return BACKEND_NAME
+
+
+def _visible_device_count(device: str) -> int:
+    if device == _CUDA:
+        return torch.cuda.device_count()
+    if device == _XPU and hasattr(torch, "xpu"):
+        return torch.xpu.device_count()
+    return 0
+
+
+def check_devices_per_node(device: str, devices_per_node: int) -> None:
+    """Fail early if a run asks for more devices per node than it can see.
+
+    The count is never inferred: it is a layout choice (one rank per tile,
+    one rank per node, ...). This only catches a request the node cannot
+    satisfy, e.g. 12 on an Aurora node exposing 6 because
+    ``ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE``. Skipped for XPU when
+    ``ZE_AFFINITY_MASK`` pins each process to its own tile(s), since each
+    rank then legitimately sees fewer devices than the node has.
+    """
+    if device == _CPU:
+        return
+    if device == _XPU and os.environ.get("ZE_AFFINITY_MASK"):
+        return
+    devices_per_node = int(devices_per_node or 1)
+    visible = _visible_device_count(device)
+    if devices_per_node <= visible:
+        return
+    if device == _XPU:
+        hint = ("ZE_FLAT_DEVICE_HIERARCHY="
+                f"{os.environ.get('ZE_FLAT_DEVICE_HIERARCHY', '<unset>')}; FLAT "
+                "exposes each tile as a device, COMPOSITE each GPU.")
+    else:
+        hint = f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}."
+    raise RuntimeError(
+        f"Requested {devices_per_node} {device} device(s) per node, but this "
+        f"process sees {visible}. {hint}"
+    )
+
+
 def reset_peak_memory_stats():
     """Reset peak memory counters for the active device backend.
 

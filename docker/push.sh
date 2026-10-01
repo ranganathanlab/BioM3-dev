@@ -3,9 +3,10 @@
 #
 # FILE: docker/push.sh
 #
-# Tag + push an ALREADY-BUILT local BioM3 image to GHCR with git-derived version
-# tags, so cloud instances pull it instead of rebuilding. The image is published
-# PUBLIC, so cloud/*.yaml pull it anonymously (no registry token).
+# Tag + push an ALREADY-BUILT local BioM3 image to the registry repo given by
+# --repo, with git-derived version tags, so cloud instances pull it instead of
+# rebuilding. The image is published PUBLIC, so cloud/*.yaml pull it anonymously
+# (no registry token).
 #
 # Pushes TWO tags per call:
 #   <variant>-<shortsha>   immutable, tied to the exact commit (reproducible)
@@ -14,7 +15,7 @@
 # SINGLE-ARCH ONLY: a local image holds one architecture, so this publishes the
 # architecture you built on. That suits the amd64-only xpu variant. For the cuda
 # variant, which ships as a multi-arch manifest list, publish with
-#   docker/build.sh --variant cuda --awscli --release
+#   docker/build.sh --variant cuda --release --repo <repo>
 # which builds every architecture in one pass and pushes both tags itself. This
 # script REFUSES to overwrite a multi-arch <variant>-dev (see --force-dev), since
 # doing so would strip an architecture off the tag cloud jobs pull.
@@ -26,12 +27,13 @@
 # the org. See cloud/README.md for the full one-time runbook.
 #
 # USAGE:
-#   docker/push.sh [--variant cuda|cpu|xpu|xpu-oneapi] [--repo R] [--local-tag T] [--allow-dirty]
-#                  [--force-dev]
+#   docker/push.sh --repo R [--variant cuda|cpu|xpu|xpu-oneapi] [--local-tag T]
+#                  [--allow-dirty] [--force-dev]
 #
-#   --variant V    cuda | cpu | xpu (default cuda) -> pushes biom3:<V> as <V>-<sha> + <V>-dev
-#   --repo R       registry repo WITHOUT the tag
-#                  (default: ghcr.io/natural-machine/biom3)
+#   --repo R       registry repo WITHOUT the tag, e.g. ghcr.io/<org>/biom3.
+#                  Required; there is no default.
+#   --variant V    cuda | cpu | xpu | xpu-oneapi (default cuda) -> pushes
+#                  biom3:<V> as <V>-<sha> + <V>-dev
 #   --local-tag T  local image to push (default: biom3:<variant>)
 #   --allow-dirty  push from a dirty tree; the sha tag gets a -dirty suffix
 #   --force-dev    replace a multi-arch <variant>-dev with this single-arch image
@@ -43,7 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 VARIANT="cuda"
-REPO="ghcr.io/natural-machine/biom3"
+REPO=""
 LOCAL_TAG=""
 ALLOW_DIRTY=0
 FORCE_DEV=0
@@ -55,10 +57,15 @@ while [[ $# -gt 0 ]]; do
         --local-tag)   LOCAL_TAG="$2"; shift 2 ;;
         --allow-dirty) ALLOW_DIRTY=1; shift ;;
         --force-dev)   FORCE_DEV=1; shift ;;
-        -h|--help)     sed -n '3,36p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '3,39p' "$0"; exit 0 ;;
         *)             echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ -z "${REPO}" ]]; then
+    echo "ERROR: --repo is required (e.g. --repo ghcr.io/<org>/biom3)." >&2
+    exit 1
+fi
 
 LOCAL_TAG="${LOCAL_TAG:-biom3:${VARIANT}}"
 
@@ -90,7 +97,7 @@ if [[ "${REMOTE_PLATFORMS}" -gt 1 && "${FORCE_DEV}" -eq 0 ]]; then
     echo "ERROR: ${MOVING_TAG} is a multi-arch manifest list; pushing this" >&2
     echo "       single-arch image over it would strip the other architecture(s)." >&2
     echo "       Publish multi-arch instead:" >&2
-    echo "         docker/build.sh --variant ${VARIANT} --awscli --release" >&2
+    echo "         docker/build.sh --variant ${VARIANT} --release --repo ${REPO}" >&2
     echo "       Or pass --force-dev to replace it deliberately." >&2
     exit 1
 fi

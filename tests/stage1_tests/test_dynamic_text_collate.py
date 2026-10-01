@@ -5,14 +5,18 @@ trailing columns. It must drop only [PAD] columns, keep Swiss-Prot and Pfam
 captions at one common length (the MLM forward concatenates them), round to a
 multiple of 64, and leave z_t unchanged to float rounding.
 """
+import os
+
+import pytest
 import torch
 from transformers import AutoTokenizer
 
 from biom3.Stage1.model import ProjectionHead, TextEncoder
 from biom3.Stage1.preprocess import collate_dynamic_text
 
-TEXT_MODEL = ("/flare/NLDesignProtein/ahowe/BioM3-dev-space/BioM3-dev/weights/LLMs/"
-              "BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext")
+TEXT_MODEL = "weights/LLMs/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext"
+pytestmark = pytest.mark.skipif(not os.path.exists(TEXT_MODEL),
+                                reason=f"Weight files not found: {TEXT_MODEL}")
 SWISS = ["PROTEIN NAME: Serine protease.",
          "PROTEIN NAME: Kinase. FUNCTION: Phosphorylates serine residues in response to stress."]
 PFAM = ["FAMILY: SH3 domain.",

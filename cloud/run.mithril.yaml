@@ -8,12 +8,13 @@
 #     --env CMD="pytest tests/"
 #
 # Examples (anything the image can run):
-#   --env CMD="biom3_ProteoScribe_sample -i data/x.pt -o outputs/y.pt --device cuda"
+#   --env CMD="biom3_ProteoScribe_sample -i data/x.pt -o outputs/y.pt"
 #   --env CMD="biom3_train_stage3 --config_path configs/stage3_training/pretrain_scratch_v1.json --epochs 1"
 #   --env CMD="nvidia-smi"           # sanity check
 #
-# The container ENTRYPOINT runs first, syncing BIOM3_WEIGHTS_URI/BIOM3_DATA_URI into
-# /app before CMD executes, and pushing /app/outputs to BIOM3_OUTPUTS_PUSH_URI after.
+# Everything a job writes belongs under /app/outputs in the container, which is
+# ~/biom3/outputs on each node. The cluster is torn down when CMD ends, so
+# copying results elsewhere is part of CMD; see cloud/README.md.
 
 resources:
   infra: mithril
@@ -25,50 +26,44 @@ config:
   mithril:
     limit_price: 1.00
 
-secrets:
-  AWS_ACCESS_KEY_ID: null
-  AWS_SECRET_ACCESS_KEY: null
-  AWS_SESSION_TOKEN: null
-
 envs:
   # ── The job: any command the image can run ────────────────────────────────
   CMD: null                  # REQUIRED — supply via --env CMD="..."
 
-  # ── Infra / data staging ──────────────────────────────────────────────────
   IMAGE: ghcr.io/natural-machine/biom3:cuda-dev
-  AWS_DEFAULT_REGION: us-east-2
-  # Weights sync is OFF by default: an empty URI means the entrypoint skips it.
-  # Set BOTH when you need weights — a URI with an empty INCLUDES pulls the whole
-  # tree. e.g. URI=s3://<WEIGHTS_BUCKET>/biom3/weights
-  #            INCLUDES="ProteoScribe/run1_base_proteoscribe.ckpt*"
-  BIOM3_WEIGHTS_URI: ""
-  BIOM3_WEIGHTS_INCLUDES: ""
-  BIOM3_DATA_URI: ""          # e.g. s3://BUCKET/PREFIX -> /app/data on every node
-  BIOM3_OUTPUTS_PUSH_URI: ""  # e.g. s3://BUCKET/PREFIX/RUN -> pushed from rank-0 node only
+  # A published weight set, pulled into /app/weights before CMD (e.g. run1_base).
+  BIOM3_WEIGHTS_BUNDLE: ""
   WANDB_API_KEY: ""
+  # Names of the variables passed into the container. Add any your CMD needs,
+  # such as credentials for your own upload, and supply their values with --env
+  # (or as secrets, below).
+  FORWARD_ENV: "WANDB_API_KEY BIOM3_WEIGHTS_BUNDLE"
+
+# Secrets are redacted in the SkyPilot dashboard. Declare each name here and pass
+# `--secret NAME` at launch, which reads the value from your shell; then add NAME
+# to FORWARD_ENV.
+# secrets:
+#   MY_STORAGE_TOKEN: null
 
 setup: |
   set -euo pipefail
   sudo docker pull "$IMAGE"
 
-# Runs on EVERY node. `-e VAR` with no value forwards VAR from this shell.
+# Runs on EVERY node.
 run: |
   set -euo pipefail
   HEAD_IP="$(echo "${SKYPILOT_NODE_IPS:-}" | head -n1)"
-  # Only the rank-0 node holds the (DDP) outputs -> gate the push to it.
-  PUSH_URI=""
-  if [ "${SKYPILOT_NODE_RANK:-0}" = "0" ]; then PUSH_URI="${BIOM3_OUTPUTS_PUSH_URI:-}"; fi
+  OUTPUTS="$HOME/biom3/outputs"
+  mkdir -p "$OUTPUTS"
+  # sudo resets the environment, so values are passed explicitly, not by name.
+  FWD=()
+  for v in $FORWARD_ENV; do
+    if [ -n "${!v:-}" ]; then FWD+=(-e "$v=${!v}"); fi
+  done
   sudo docker run --rm --gpus all --net=host --ipc=host \
-    -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
-    -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
-    -e AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}" \
-    -e AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-}" \
-    -e BIOM3_WEIGHTS_URI="${BIOM3_WEIGHTS_URI:-}" \
-    -e BIOM3_WEIGHTS_INCLUDES="${BIOM3_WEIGHTS_INCLUDES:-}" \
-    -e BIOM3_DATA_URI="${BIOM3_DATA_URI:-}" \
-    -e BIOM3_OUTPUTS_PUSH_URI="$PUSH_URI" \
+    -v "$OUTPUTS:/app/outputs" \
     -e MASTER_ADDR="$HEAD_IP" \
     -e SKYPILOT_NODE_RANK="${SKYPILOT_NODE_RANK:-0}" \
     -e SKYPILOT_NUM_NODES="${SKYPILOT_NUM_NODES:-1}" \
-    -e WANDB_API_KEY="${WANDB_API_KEY:-}" \
+    ${FWD[@]+"${FWD[@]}"} \
     "$IMAGE" bash -lc "$CMD"

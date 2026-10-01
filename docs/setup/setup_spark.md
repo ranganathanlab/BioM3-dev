@@ -38,3 +38,7 @@ python -m pytest tests -rs                       # Full suite, report skipped te
 ```
 
 Some tests will be skipped if pretrained weights have not been synced. See [setup_shared_weights.md](./setup_shared_weights.md) for the list of required files.
+
+## Docker
+
+To run in the CUDA container instead of a conda environment, see [setup_docker.md](./setup_docker.md). If `weights/` or `data/` hold symlinks into other host directories, list those directories in `BIOM3_BIND_EXTRA` so the links resolve inside the container.

@@ -6,6 +6,8 @@
 # USAGE: stage3_train_multinode.sh CONFIG_PATH NUM_NODES NGPU_PER_NODE \
 #        DEVICE RUN_ID [additional --key value overrides]
 #
+#   DEVICE: cuda | xpu | cpu | auto (auto = the detected GPU backend; never CPU)
+#
 # DESCRIPTION: Multi-node wrapper for Stage 3 training (pretraining and
 #   finetuning). Dispatches to the machine-specific launcher under
 #   scripts/launchers/${BIOM3_LAUNCHER:-${BIOM3_MACHINE}}_multinode.sh.

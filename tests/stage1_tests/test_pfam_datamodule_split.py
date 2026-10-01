@@ -52,6 +52,7 @@ def test_valid_fraction_and_seed_dependence():
     assert v42 != v7
 
 
+@pytest.mark.usefixtures("no_process_group")
 def test_single_process_is_a_no_op():
     train, valid = _frame(10), _frame(5, start=100)
     t, v, per_rank = equalize_across_ranks(train, valid, seed=0)

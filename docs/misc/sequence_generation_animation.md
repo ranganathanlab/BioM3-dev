@@ -47,12 +47,12 @@ selected from index 0 up to (not including) the requested count.
 ```bash
 --animate_replicas 1         # replica 0 only (default when animating)
 --animate_replicas 3         # replicas 0, 1, 2
---animate_replicas all       # every replica (up to num_replicas in the JSON config)
+--animate_replicas all       # every replica (up to num_replicas)
 --animate_replicas none      # no animation
 ```
 
-If the requested count exceeds `num_replicas` from the JSON config, it is
-silently clamped to `num_replicas` and a warning is logged.
+If the requested count exceeds `num_replicas` (from `--num_replicas`, else the
+JSON config), it is clamped to `num_replicas` and a warning is logged.
 
 ### `--animation_dir`
 

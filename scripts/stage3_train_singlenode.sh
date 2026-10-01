@@ -6,6 +6,8 @@
 # USAGE: stage3_train_singlenode.sh CONFIG_PATH NGPU DEVICE \
 #        RUN_ID [additional --key value overrides]
 #
+#   DEVICE: cuda | xpu | cpu | auto (auto = the detected GPU backend; never CPU)
+#
 # DESCRIPTION: Single-node wrapper for Stage 3 training (pretraining and
 #   finetuning). Dispatches to the machine-specific launcher under
 #   scripts/launchers/${BIOM3_LAUNCHER:-${BIOM3_MACHINE}}_singlenode.sh, which knows how to

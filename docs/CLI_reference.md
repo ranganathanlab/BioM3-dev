@@ -16,6 +16,49 @@ Entrypoints covered elsewhere:
 
 ---
 
+## The `biom3` command
+
+`biom3 <command> [<args>]` runs the entrypoints below under shorter names. Each command takes exactly the same arguments as the `biom3_*` entrypoint it runs, so the argument tables in this document apply unchanged. The `biom3_*` entrypoints remain available.
+
+| Command | Runs | Listed by |
+| ------- | ---- | --------- |
+| `biom3 embed` | `biom3_embedding_pipeline` | `biom3 --help` |
+| `biom3 generate` | `biom3_ProteoScribe_sample` | `biom3 --help` |
+| `biom3 finetune` | `biom3_train_stage3 --finetune True` | `biom3 --help` |
+| `biom3 finetune-generalized` | `biom3_finetune_stage3` | `biom3 --help` |
+| `biom3 train stage1` | `biom3_train_stage1` | `biom3 --help` |
+| `biom3 train stage2` | `biom3_train_stage2` | `biom3 --help` |
+| `biom3 train stage3` | `biom3_train_stage3` | `biom3 --help` |
+| `biom3 fetch weights` | `biom3_fetch_weights` | `biom3 --help` |
+| `biom3 fetch dataset` | `biom3_fetch_dataset` | `biom3 --help` |
+| `biom3 stage1 infer` | `biom3_PenCL_inference` | `biom3 --help --all` (advanced) |
+| `biom3 stage2 sample` | `biom3_Facilitator_sample` | `biom3 --help --all` (advanced) |
+| `biom3 manifold fit` | `biom3_fit_manifold` | `biom3 --help --all` (advanced) |
+| `biom3 manifold score` | `biom3_score_manifold` | `biom3 --help --all` (advanced) |
+| `biom3 rl grpo` | `biom3_grpo_train` | `biom3 --help --all` (experimental) |
+| `biom3 rl gdpo` | `biom3_gdpo_train` | `biom3 --help --all` (experimental) |
+| `biom3 rl dpo` | `biom3_dpo_train` | `biom3 --help --all` (experimental) |
+| `biom3 multidomain finetune` | `biom3_finetune_multidomain` | `biom3 --help --all` (experimental) |
+| `biom3 multidomain sample` | `biom3_sample_multidomain` | `biom3 --help --all` (experimental) |
+
+```bash
+biom3 --help                 # the main commands
+biom3 --help --all           # every command, including advanced and experimental
+biom3 train --help           # the commands in a group
+biom3 train stage3 --help    # one command's arguments
+biom3 --version
+```
+
+Notes:
+
+- `biom3 finetune` sets `--finetune True` itself. Passing `--finetune` to it is an error; use `biom3 train stage3` to train without finetuning.
+- Commands in every group are runnable. The group only decides whether `biom3 --help` lists the command without `--all`.
+- Not every entrypoint has a `biom3` command. Dataset building (`biom3_build_*`), `biom3_app`, and the benchmarks are available only under their `biom3_*` names.
+- An existing editable install needs `pip install -e .` rerun once to gain the `biom3` command. Container images built before the command was added do not have it; use the `biom3_*` names there.
+- The commands are declared in [src/biom3/cli/registry.py](../src/biom3/cli/registry.py). Exposing another entrypoint is one entry there, provided its module defines `parse_arguments(argv)` and `main(args)`.
+
+---
+
 ## Inference Entrypoints
 
 ### `biom3_PenCL_inference` — Stage 1 PenCL inference
@@ -39,7 +82,7 @@ Produces joint protein/text embeddings (`z_p`, `z_t`) from a CSV of (sequence, p
 
 | Arg | Type | Default | Description |
 |---|---|---|---|
-| `--device` | str | `cuda` | One of `cpu`, `cuda`, `xpu`. |
+| `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected backend: CUDA, then XPU, else CPU. |
 | `--batch_size` | int | 32 | Inference batch size. |
 | `--num_workers` | int | 0 | DataLoader worker count. |
 | `--load_from_checkpoint` | flag | False | Force loading `model_path` as a Lightning `.ckpt` (otherwise inferred from extension). |
@@ -80,7 +123,7 @@ Maps Stage 1 text embeddings (`z_t`) into the protein-embedding space (`z_c`). C
 
 | Arg | Type | Default | Description |
 |---|---|---|---|
-| `--device` | str | `cuda` | One of `cpu`, `cuda`, `xpu`. |
+| `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected backend: CUDA, then XPU, else CPU. |
 | `--mmd_sample_limit` | int | -1 | Cap samples for MMD computation. `-1` = all. **Print-only** — saved `z_c` embeddings are unaffected. |
 
 #### Example
@@ -118,9 +161,10 @@ Generates protein sequences from facilitated embeddings via diffusion sampling. 
 | Arg | Type | Default | Description |
 |---|---|---|---|
 | `--seed` | int | 0 | RNG seed. |
-| `--device` | str | `cuda` | One of `cpu`, `cuda`, `xpu`. |
+| `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected backend: CUDA, then XPU, else CPU. |
 | `--unmasking_order` | str | None | One of `random`, `confidence`, `confidence_no_pad`. Defaults to `random`. |
 | `--token_strategy` | str | None | One of `sample` (Gumbel-max, default) or `argmax` (deterministic). |
+| `--num_replicas` | int | None | Sequences to generate per prompt. Overrides the config's `num_replicas`; when neither sets it, 5. `None` means unset. |
 | `--pre_unmask` | flag | False | Start diffusion from a partially-unmasked state. Requires `--pre_unmask_config`. |
 | `--pre_unmask_config` | str | None | Path to JSON describing the pre-unmask strategy. |
 | `--alpha` | float | 0.0 | Weight on `z_p` when conditioning: `y = alpha * z_p + (1 - alpha) * z_c`. `0` (default) is text-only. Anything above 0 requires `z_p` in `--input_path`, which Stage 1 emits and Stage 2 preserves. Only meaningful for a model trained with a matching blend — see [Conditioning blend](#conditioning-blend-alpha). |
@@ -178,13 +222,13 @@ Runs `biom3_PenCL_inference` → `biom3_Facilitator_sample` → HDF5 compilation
 | `--facilitator_weights` | str | Path to Facilitator weights or checkpoint. |
 | `--pencl_config` | str | Path to Stage 1 JSON config. |
 | `--facilitator_config` | str | Path to Stage 2 JSON config. |
-| `--prefix` | str | Filename prefix for intermediate and final output files. |
+| `--prefix` | str | Filename prefix for intermediate and final output files, the run log (`<prefix>.run.log`), and the manifest (`<prefix>.build_manifest.json`). |
 
 #### Optional arguments
 
 | Arg | Type | Default | Description |
 |---|---|---|---|
-| `--device` | str | `cuda` | One of `cpu`, `cuda`, `xpu`. |
+| `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected backend: CUDA, then XPU, else CPU. |
 | `--batch_size` | int | 256 | Stage 1 batch size. |
 | `--num_workers` | int | 0 | Stage 1 DataLoader worker count. |
 | `--no_amp` | flag | False | Forwarded to Stage 1: run the forward pass in fp32 instead of autocast. |
@@ -192,6 +236,21 @@ Runs `biom3_PenCL_inference` → `biom3_Facilitator_sample` → HDF5 compilation
 | `--cross_comparison_sample_limit` | int | 0 | Forwarded to Stage 1. `0` = skip the O(n²) cross-comparison metrics (default), `-1` = all, positive = that many. **Print-only**. |
 | `--mmd_sample_limit` | int | 1000 | Stage 2 MMD sample cap. |
 | `--dataset_key` | str | `MMD_data` | HDF5 group name for the compiled output. |
+
+#### Optional arguments — Stage 3 generation
+
+With `--generate`, the terminal step is [`biom3_ProteoScribe_sample`](#biom3_proteoscribe_sample--stage-3-sequence-generation) instead of HDF5 compilation.
+
+| Arg | Type | Default | Description |
+|---|---|---|---|
+| `--generate` | flag | False | Run Stage 3 sampling after Stage 2 instead of compiling to HDF5. |
+| `--proteoscribe_weights` | str | None | ProteoScribe weights or checkpoint (overrides `--weight_set`). Required with `--generate`. |
+| `--proteoscribe_config` | str | None | Stage 3 JSON config. Required with `--generate`. |
+| `--seed` | int | 0 | Stage 3 sampling seed. `0` or less picks one at random. |
+| `--no_fasta` | flag | False | Skip the FASTA output, which is on by default here. |
+| `--token_strategy` | str | None | Forwarded to the sampler. |
+| `--unmasking_order` | str | None | Forwarded to the sampler. |
+| `--num_replicas` | int | None | Forwarded to the sampler. Unset defers to the Stage 3 config, else 5. |
 
 ---
 
@@ -222,7 +281,7 @@ The argparser declares ~50 flags. Highlights below; run `biom3_train_stage1 --he
 | `--data_path` | str | None | Path to Swiss-Prot CSV. |
 | `--pfam_data_path` | str | `'None'` | Path to Pfam CSV (required when `dataset_type=pfam`). |
 | `--dataset_type` | str | `default` | One of `default`, `masked`, `pfam`, `pfam_ablated`. |
-| `--device` | str | `cuda` | One of `cuda`, `xpu`, `cpu`. |
+| `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected GPU backend (CUDA, then XPU); it never falls back to CPU, so pass `cpu` to train on CPU. The run also stops early if `--devices_per_node` exceeds the devices this process can see. |
 | `--devices_per_node` | int | 1 | GPUs (CUDA) or tiles (XPU) per node. (Deprecated alias: `--gpu_devices` — still accepted, emits a warning.) |
 | `--num_nodes` | int | 1 | Nodes participating in training. |
 | `--batch_size` | int | 8 | Per-device mini-batch size. |
@@ -233,6 +292,12 @@ The argparser declares ~50 flags. Highlights below; run `biom3_train_stage1 --he
 | `--head_lr` / `--protein_encoder_lr` / `--text_encoder_lr` | float | varies | Per-component learning rates. |
 | `--scale_learning_rate` | str | `'False'` | `'True'`/`'False'`. Scale LR by world size. |
 | `--precision` | str | `'32'` | One of `'32'`, `'16'`, `'bf16'`, `'bf16-mixed'`. |
+| `--uniformity_weight` | float | 0.0 | Weight of the Wang & Isola (2020) uniformity term on L2-normalized joint embeddings (pfam dataset types). 0 disables it. Logged as `{train,valid}_loss_unif_{protein,text}`. |
+| `--uniformity_t` | float | 2.0 | Scale `t` of the uniformity term's Gaussian potential; its high-dimensional floor is about `-2t`. |
+| `--uniformity_on` | str | `both` | `protein`, `text`, or `both` (mean of the two). |
+| `--log_uniformity` | str | `'False'` | `'True'`/`'False'`. Measure and log the uniformity term without training on it, so a weight-0 control reports the same metric. Implied when the weight is > 0. |
+| `--mask_same_sequence` | str | `'False'` | `'True'`/`'False'`. Drop candidates whose protein sequence is identical to the anchor's from the contrastive denominator. Swiss-Prot carries ~8.9 caption variants per accession, so ~5.6% of rows have such a false negative in the pooled batch. |
+| `--mask_same_family` | str | `'False'` | `'True'`/`'False'`. Drop candidates drawn on the same Pfam family as the anchor. At M = 49,152 a row has ~25 of these, against the single `(i, i±N)` homolog the index rule already covers; for L_PFC they are the items it exists to pull together. Both flags default off so Run 1 stays reproducible. |
 | `--resume_from_checkpoint` | str | `'None'` | Path to a Lightning `.ckpt` to resume from. |
 | `--pretrained_weights` | str | `'None'` | Path to a raw weights file (no optimizer state). |
 | `--wandb` | str | `'False'` | `'True'`/`'False'`. Enable wandb logging (requires `WANDB_API_KEY`). |
@@ -271,7 +336,7 @@ None positional.
 | `--pfam_data_path` | str | `'None'` | Path to Stage 1 Pfam embeddings `.pt` dict. |
 | `--output_swissprot_dict_path` | str | None | Where to save Stage 2 SwissProt embeddings dict. |
 | `--output_pfam_dict_path` | str | None | Where to save Stage 2 Pfam embeddings dict. |
-| `--device` | str | `cuda` | One of `cuda`, `xpu`, `cpu`. |
+| `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected GPU backend (CUDA, then XPU); it never falls back to CPU, so pass `cpu` to train on CPU. The run also stops early if `--devices_per_node` exceeds the devices this process can see. |
 | `--devices_per_node` | int | 1 | GPUs/tiles per node. (Deprecated alias: `--gpu_devices`.) |
 | `--num_nodes` | int | 1 | Nodes. |
 | `--batch_size` | int | 32 | Per-device batch size. |
@@ -319,7 +384,7 @@ The argparser is the largest in the project (70+ flags across `get_args`, `get_m
 | `--lr` | float | 3e-4 | Base learning rate. |
 | `--scale_learning_rate` | str | `'True'` | Scale LR by world size. |
 | `--precision` | str | `no` | One of `no`, `fp16`, `bf16`, `32`. |
-| `--device` | str | `cuda` | One of `cpu`, `cuda`, `xpu`. |
+| `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected GPU backend (CUDA, then XPU); it never falls back to CPU, so pass `cpu` to train on CPU. The run also stops early if `--devices_per_node` exceeds the devices this process can see. |
 | `--devices_per_node` | int | 1 | GPUs/tiles per node. (Deprecated alias: `--gpu_devices`.) |
 | `--num_nodes` | int | 1 | Nodes. |
 | `--distributed_strategy` | str | `deepspeed_zero2` | One of `deepspeed_zero2` (DeepSpeed ZeRO-2 + CPU offload, sharded checkpoint dir) or `ddp` (plain DDP with `static_graph=True`, single-file checkpoint). Distinct from `--training_strategy` which selects `primary_only` vs `combine` *data* mixing. |

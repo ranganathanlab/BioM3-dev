@@ -45,7 +45,7 @@ import torch.nn as nn
 import biom3.Stage3.sampling_analysis as Stage3_sample_tools
 import biom3.Stage3.animation_tools as Stage3_ani_tools
 from biom3.Stage3.io import prepare_model_ProteoScribe
-from biom3.core.helpers import load_json_config, convert_to_namespace
+from biom3.core.helpers import load_json_config, convert_to_namespace, optional_positive_int
 from biom3.core.run_utils import (
     get_biom3_version,
     get_git_hash,
@@ -54,6 +54,7 @@ from biom3.core.run_utils import (
     write_manifest,
 )
 from biom3.backend.device import setup_logger, get_backend_name, set_float32_matmul_precision
+from biom3.backend.device import DEVICE_CHOICES, resolve_device
 from biom3.core.distributed import (
     barrier,
     broadcast_int,
@@ -71,6 +72,8 @@ from biom3.Stage3.inpaint import (
 
 logger = setup_logger(__name__)
 
+DEFAULT_NUM_REPLICAS = 5
+
 
 # Step 0: Argument Parser Function
 def parse_arguments(args):
@@ -85,8 +88,9 @@ def parse_arguments(args):
                         help="Path to save output embeddings")
     parser.add_argument('--seed', type=int, default=0,
                         help="seed for random number generation")
-    parser.add_argument('--device', type=str, default="cuda",
-                        choices=["cpu", "cuda", "xpu"], help="available device")
+    parser.add_argument('--device', type=str, default="auto",
+                        choices=list(DEVICE_CHOICES),
+                        help="available device; auto = the detected backend (CUDA, XPU, else CPU)")
     parser.add_argument('--unmasking_order', type=str, default=None,
                         choices=["random", "confidence", "confidence_no_pad"],
                         help="Position unmasking order: 'random' (default), "
@@ -96,6 +100,11 @@ def parse_arguments(args):
     parser.add_argument('--token_strategy', type=str, default=None,
                         choices=["sample", "argmax"],
                         help="Token selection: 'sample' (Gumbel-max, default) or 'argmax' (deterministic)")
+    parser.add_argument('--num_replicas', type=optional_positive_int, default=None,
+                        metavar='N',
+                        help="Sequences to generate per prompt. Overrides the "
+                             "config's num_replicas; when neither sets it, "
+                             f"defaults to {DEFAULT_NUM_REPLICAS}. 'None' means unset.")
     parser.add_argument('--animate_prompts', type=str, nargs='+', default=None,
                         metavar='IDX',
                         help="Prompt indices to animate (e.g. 0 1 2), 'all', or 'none'. "
@@ -861,6 +870,7 @@ def blend_conditioning(embedding_dataset, alpha):
     return alpha * z_p + (1.0 - alpha) * z_c
 
 def main(args, _setup_logging=True):
+    args.device = resolve_device(args.device)
     # Parse arguments
     config_args_parser = args
 
@@ -882,251 +892,265 @@ def main(args, _setup_logging=True):
     file_handler = None
     if _setup_logging and rank == 0:
         log_path, file_handler = setup_file_logging(outdir)
-    start_time = datetime.now()
-    logger.info("=" * 60)
-    logger.info("ProteoScribe sampling (Stage 3)")
-    logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
-    logger.info("Command:     %s", " ".join(sys.argv))
-    if world_size > 1:
-        logger.info("Distributed: rank=%d local_rank=%d world_size=%d device=%s",
-                    rank, local_rank, world_size, resolved_device)
-    logger.info("=" * 60)
+    try:
+        start_time = datetime.now()
+        logger.info("=" * 60)
+        logger.info("ProteoScribe sampling (Stage 3)")
+        logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
+        logger.info("Command:     %s", " ".join(sys.argv))
+        if world_size > 1:
+            logger.info("Distributed: rank=%d local_rank=%d world_size=%d device=%s",
+                        rank, local_rank, world_size, resolved_device)
+        logger.info("=" * 60)
 
-    seed = config_args_parser.seed
+        seed = config_args_parser.seed
 
-    if seed <= 0:
-        if rank == 0:
-            seed = int(np.random.randint(2**32))
-        seed = broadcast_int(seed, src=0)
+        if seed <= 0:
+            if rank == 0:
+                seed = int(np.random.randint(2**32))
+            seed = broadcast_int(seed, src=0)
 
-    set_seed(seed)
-    logger.info("Seed: %s", seed)
+        set_seed(seed)
+        logger.info("Seed: %s", seed)
 
-    # Load and convert JSON config
-    config_dict = load_json_config(config_args_parser.config_path)
-    raw_config = copy.deepcopy(config_dict)
-    config_args = convert_to_namespace(config_dict)
+        # Load and convert JSON config
+        config_dict = load_json_config(config_args_parser.config_path)
+        raw_config = copy.deepcopy(config_dict)
+        config_args = convert_to_namespace(config_dict)
 
-    # fp32 matmul precision (TF32): CLI overrides config, config default is "high".
-    set_float32_matmul_precision(
-        config_args_parser.float32_matmul_precision
-        or getattr(config_args, "float32_matmul_precision", "high")
-    )
+        # fp32 matmul precision (TF32): CLI overrides config, config default is "high".
+        set_float32_matmul_precision(
+            config_args_parser.float32_matmul_precision
+            or getattr(config_args, "float32_matmul_precision", "high")
+        )
 
-    config_args.device = config_args_parser.device
-    config_args._rank = rank
-    config_args._world_size = world_size
-    config_args._base_seed = int(seed)
+        config_args.device = config_args_parser.device
+        config_args._rank = rank
+        config_args._world_size = world_size
+        config_args._base_seed = int(seed)
 
-    # Merge CLI overrides for sampling parameters (fall back to JSON, then defaults)
-    for attr, default in [('unmasking_order', 'random'), ('token_strategy', 'sample')]:
-        cli_val = getattr(config_args_parser, attr, None)
-        if cli_val is not None:
-            setattr(config_args, attr, cli_val)
-        elif not hasattr(config_args, attr):
-            setattr(config_args, attr, default)
+        # Merge CLI overrides for sampling parameters (fall back to JSON, then defaults)
+        for attr, default in [('unmasking_order', 'random'), ('token_strategy', 'sample')]:
+            cli_val = getattr(config_args_parser, attr, None)
+            if cli_val is not None:
+                setattr(config_args, attr, cli_val)
+            elif not hasattr(config_args, attr):
+                setattr(config_args, attr, default)
 
-    logger.info("Unmasking order: %s", config_args.unmasking_order)
-    logger.info("Token strategy: %s", config_args.token_strategy)
+        cli_num_replicas = optional_positive_int(
+            getattr(config_args_parser, 'num_replicas', None), name="--num_replicas")
+        config_num_replicas = optional_positive_int(
+            getattr(config_args, 'num_replicas', None), name="config num_replicas")
+        if cli_num_replicas is not None:
+            config_args.num_replicas = cli_num_replicas
+        elif config_num_replicas is not None:
+            config_args.num_replicas = config_num_replicas
+        else:
+            config_args.num_replicas = DEFAULT_NUM_REPLICAS
 
-    # Pre-unmask feature: snapshot the architectural sequence length (current
-    # diffusion_steps value from config == seq_len trained on), then if
-    # enabled, override diffusion_steps with the budget D.
-    config_args.sequence_length = config_args.diffusion_steps
-    config_args.pre_unmask = bool(getattr(config_args_parser, 'pre_unmask', False))
-    if config_args.pre_unmask:
-        pre_unmask_cfg = load_pre_unmask_config(config_args_parser.pre_unmask_config)
-        if pre_unmask_cfg["diffusion_budget"] > config_args.sequence_length:
-            raise ValueError(
-                f"pre_unmask diffusion_budget ({pre_unmask_cfg['diffusion_budget']}) "
-                f"must be <= sequence_length ({config_args.sequence_length})"
+        logger.info("Unmasking order: %s", config_args.unmasking_order)
+        logger.info("Token strategy: %s", config_args.token_strategy)
+        logger.info("Replicas per prompt: %d", config_args.num_replicas)
+
+        # Pre-unmask feature: snapshot the architectural sequence length (current
+        # diffusion_steps value from config == seq_len trained on), then if
+        # enabled, override diffusion_steps with the budget D.
+        config_args.sequence_length = config_args.diffusion_steps
+        config_args.pre_unmask = bool(getattr(config_args_parser, 'pre_unmask', False))
+        if config_args.pre_unmask:
+            pre_unmask_cfg = load_pre_unmask_config(config_args_parser.pre_unmask_config)
+            if pre_unmask_cfg["diffusion_budget"] > config_args.sequence_length:
+                raise ValueError(
+                    f"pre_unmask diffusion_budget ({pre_unmask_cfg['diffusion_budget']}) "
+                    f"must be <= sequence_length ({config_args.sequence_length})"
+                )
+            config_args.diffusion_steps = pre_unmask_cfg["diffusion_budget"]
+            config_args.pre_unmask_strategy = pre_unmask_cfg["strategy"]
+            config_args.pre_unmask_fill_with = pre_unmask_cfg["fill_with"]
+            logger.info(
+                "Pre-unmask enabled: strategy=%s fill_with=%s D=%d seq_len=%d",
+                config_args.pre_unmask_strategy,
+                config_args.pre_unmask_fill_with,
+                config_args.diffusion_steps,
+                config_args.sequence_length,
             )
-        config_args.diffusion_steps = pre_unmask_cfg["diffusion_budget"]
-        config_args.pre_unmask_strategy = pre_unmask_cfg["strategy"]
-        config_args.pre_unmask_fill_with = pre_unmask_cfg["fill_with"]
-        logger.info(
-            "Pre-unmask enabled: strategy=%s fill_with=%s D=%d seq_len=%d",
-            config_args.pre_unmask_strategy,
-            config_args.pre_unmask_fill_with,
-            config_args.diffusion_steps,
-            config_args.sequence_length,
+        elif getattr(config_args_parser, 'pre_unmask_config', None):
+            logger.warning(
+                "--pre_unmask_config ignored because --pre_unmask is not set"
+            )
+
+        # In-painting feature: start diffusion from a partially-filled template.
+        # The diffusion budget is derived per-prompt from the template's mask count
+        # (handled in batch_stage3_generate_sequences), so diffusion_steps is left
+        # at the architectural sequence length here.
+        _resolve_inpaint_args(config_args, config_args_parser)
+
+        # load test dataset
+        embedding_dataset = torch.load(config_args_parser.input_path)
+
+        # load model
+        model = prepare_model(args=config_args_parser, config_args=config_args)
+
+        # TODO: re-enable torch.compile once Triton supports this GPU's compute
+        # capability (sm_121a / CUDA 12.1). See ptxas "gpu-name" error in tests.
+        # if get_backend_name() == "cuda":
+        #     model = torch.compile(model)
+        #     logger.info("Model compiled with torch.compile (inductor)")
+
+        # Resolve animation targets
+        alpha = getattr(config_args_parser, 'alpha', 0.0)
+        z_c = blend_conditioning(embedding_dataset, alpha)
+        logger.info("Conditioning blend: alpha=%.3f (0 = z_c, 1 = z_p)", alpha)
+
+        num_prompts = z_c.size(0) if isinstance(z_c, torch.Tensor) else len(z_c)
+        animate_prompts_set = resolve_animate_prompts(
+            parse_animate_prompts(config_args_parser.animate_prompts),
+            num_prompts,
         )
-    elif getattr(config_args_parser, 'pre_unmask_config', None):
-        logger.warning(
-            "--pre_unmask_config ignored because --pre_unmask is not set"
+        animate_replicas_set = resolve_animate_replicas(
+            parse_animate_replicas(config_args_parser.animate_replicas),
+            config_args.num_replicas,
         )
 
-    # In-painting feature: start diffusion from a partially-filled template.
-    # The diffusion budget is derived per-prompt from the template's mask count
-    # (handled in batch_stage3_generate_sequences), so diffusion_steps is left
-    # at the architectural sequence length here.
-    _resolve_inpaint_args(config_args, config_args_parser)
+        # sample sequences
+        store_probs = getattr(config_args_parser, 'store_probabilities', False)
+        save_frames = getattr(config_args_parser, 'save_animation_frames', False)
+        results = batch_stage3_generate_sequences(
+                args=config_args,
+                model=model,
+                z_t=z_c,
+                animate_prompts=animate_prompts_set,
+                animate_replicas=animate_replicas_set,
+                store_probabilities=store_probs,
+                record_confidence=save_frames,
+        )
+        animation_frames = results["animation_frames"]
+        tokens = results["tokens"]
+        stored_probs = results["stored_probs"]
+        stored_final_frames = results["stored_final_frames"]
+        rank_local_sequences = results["rank_local_sequences"]
 
-    # load test dataset
-    embedding_dataset = torch.load(config_args_parser.input_path)
+        # Gather rank-local sequence shards to rank 0 and merge into the
+        # public prompt-keyed dict. No-op when world_size == 1.
+        if world_size > 1:
+            shards = gather_object_to_main(rank_local_sequences)
+        else:
+            shards = [rank_local_sequences]
 
-    # load model
-    model = prepare_model(args=config_args_parser, config_args=config_args)
+        design_sequence_dict = None
+        if rank == 0:
+            design_sequence_dict = _merge_shards(shards, num_prompts, config_args.num_replicas)
+            logger.info("design_sequence_dict=%s", design_sequence_dict)
 
-    # TODO: re-enable torch.compile once Triton supports this GPU's compute
-    # capability (sm_121a / CUDA 12.1). See ptxas "gpu-name" error in tests.
-    # if get_backend_name() == "cuda":
-    #     model = torch.compile(model)
-    #     logger.info("Model compiled with torch.compile (inductor)")
+            torch.save(design_sequence_dict, f"{config_args_parser.output_path}")
 
-    # Resolve animation targets
-    alpha = getattr(config_args_parser, 'alpha', 0.0)
-    z_c = blend_conditioning(embedding_dataset, alpha)
-    logger.info("Conditioning blend: alpha=%.3f (0 = z_c, 1 = z_p)", alpha)
-
-    num_prompts = z_c.size(0) if isinstance(z_c, torch.Tensor) else len(z_c)
-    animate_prompts_set = resolve_animate_prompts(
-        parse_animate_prompts(config_args_parser.animate_prompts),
-        num_prompts,
-    )
-    animate_replicas_set = resolve_animate_replicas(
-        parse_animate_replicas(config_args_parser.animate_replicas),
-        config_args.num_replicas,
-    )
-
-    # sample sequences
-    store_probs = getattr(config_args_parser, 'store_probabilities', False)
-    save_frames = getattr(config_args_parser, 'save_animation_frames', False)
-    results = batch_stage3_generate_sequences(
-            args=config_args,
-            model=model,
-            z_t=z_c,
-            animate_prompts=animate_prompts_set,
-            animate_replicas=animate_replicas_set,
-            store_probabilities=store_probs,
-            record_confidence=save_frames,
-    )
-    animation_frames = results["animation_frames"]
-    tokens = results["tokens"]
-    stored_probs = results["stored_probs"]
-    stored_final_frames = results["stored_final_frames"]
-    rank_local_sequences = results["rank_local_sequences"]
-
-    # Gather rank-local sequence shards to rank 0 and merge into the
-    # public prompt-keyed dict. No-op when world_size == 1.
-    if world_size > 1:
-        shards = gather_object_to_main(rank_local_sequences)
-    else:
-        shards = [rank_local_sequences]
-
-    design_sequence_dict = None
-    if rank == 0:
-        design_sequence_dict = _merge_shards(shards, num_prompts, config_args.num_replicas)
-        logger.info("design_sequence_dict=%s", design_sequence_dict)
-
-        torch.save(design_sequence_dict, f"{config_args_parser.output_path}")
-
-    # Write FASTA files (rank 0 only)
-    if rank == 0 and getattr(config_args_parser, 'fasta', False):
-        fasta_dir = config_args_parser.fasta_dir or os.path.join(outdir, "fasta")
-        os.makedirs(fasta_dir, exist_ok=True)
-        for prompt_key, replicas in design_sequence_dict.items():
-            if prompt_key.startswith("_"):
-                continue
-            fasta_path = os.path.join(fasta_dir, f"{prompt_key}.fasta")
-            with open(fasta_path, 'w') as fh:
-                for r_idx, seq in enumerate(replicas):
-                    fh.write(f">{prompt_key}_replica_{r_idx} seed={seed}\n{seq}\n")
-        logger.info("FASTA files written to %s", fasta_dir)
-        if getattr(config_args_parser, 'fasta_merge', False):
-            merged_path = os.path.join(fasta_dir, "all_sequences.fasta")
-            with open(merged_path, 'w') as fh:
-                for prompt_key, replicas in design_sequence_dict.items():
-                    if prompt_key.startswith("_"):
-                        continue
+        # Write FASTA files (rank 0 only)
+        if rank == 0 and getattr(config_args_parser, 'fasta', False):
+            fasta_dir = config_args_parser.fasta_dir or os.path.join(outdir, "fasta")
+            os.makedirs(fasta_dir, exist_ok=True)
+            for prompt_key, replicas in design_sequence_dict.items():
+                if prompt_key.startswith("_"):
+                    continue
+                fasta_path = os.path.join(fasta_dir, f"{prompt_key}.fasta")
+                with open(fasta_path, 'w') as fh:
                     for r_idx, seq in enumerate(replicas):
                         fh.write(f">{prompt_key}_replica_{r_idx} seed={seed}\n{seq}\n")
-            logger.info("Merged FASTA written to %s", merged_path)
+            logger.info("FASTA files written to %s", fasta_dir)
+            if getattr(config_args_parser, 'fasta_merge', False):
+                merged_path = os.path.join(fasta_dir, "all_sequences.fasta")
+                with open(merged_path, 'w') as fh:
+                    for prompt_key, replicas in design_sequence_dict.items():
+                        if prompt_key.startswith("_"):
+                            continue
+                        for r_idx, seq in enumerate(replicas):
+                            fh.write(f">{prompt_key}_replica_{r_idx} seed={seed}\n{seq}\n")
+                logger.info("Merged FASTA written to %s", merged_path)
 
-    # Save / render animations for the selected (prompt, replica) pairs.
-    if animation_frames:
-        animation_dir = config_args_parser.animation_dir or os.path.join(outdir, "animations")
-        os.makedirs(animation_dir, exist_ok=True)
+        # Save / render animations for the selected (prompt, replica) pairs.
+        if animation_frames:
+            animation_dir = config_args_parser.animation_dir or os.path.join(outdir, "animations")
+            os.makedirs(animation_dir, exist_ok=True)
 
-        # Per-step token trajectory, for downstream interactive rendering.
-        if getattr(config_args_parser, 'save_animation_frames', False):
-            save_animation_frames(
-                animation_frames, tokens, animation_dir,
-                confidence=results["animation_confidence"],
-            )
-
-        if not getattr(config_args_parser, 'no_gif', False):
-            animation_style = getattr(config_args_parser, 'animation_style', 'brightness')
-            requested_metrics = getattr(config_args_parser, 'animation_metrics', None) or []
-            if (animation_style != 'brightness' or requested_metrics) and not stored_probs:
-                logger.warning("--animation_style=%s / --animation_metrics requires "
-                               "--store_probabilities; falling back to default animation",
-                               animation_style)
-            logger.info("Saving %d GIF animation(s) to %s", len(animation_frames), animation_dir)
-            for (p_idx, r_idx), frames in animation_frames.items():
-                gif_path = os.path.join(animation_dir, f"prompt_{p_idx}_replica_{r_idx}.gif")
-                frame_probs = stored_probs.get((p_idx, r_idx)) if stored_probs else None
-
-                # Build metric annotations for this (prompt, replica)
-                metrics = []
-                if frame_probs is not None and requested_metrics:
-                    for name in requested_metrics:
-                        if name == "confidence":
-                            metrics.append(
-                                Stage3_ani_tools.confidence_metric(frame_probs))
-                        else:
-                            logger.warning("Unknown animation metric %r, skipping", name)
-
-                Stage3_ani_tools.generate_sequence_animation(
-                    frames=frames,
-                    tokens=tokens,
-                    output_path=gif_path,
-                    probs=frame_probs,
-                    prob_style=animation_style,
-                    metrics=metrics or None,
-                    title=f"Prompt {p_idx} \u00b7 Replica {r_idx}",
+            # Per-step token trajectory, for downstream interactive rendering.
+            if getattr(config_args_parser, 'save_animation_frames', False):
+                save_animation_frames(
+                    animation_frames, tokens, animation_dir,
+                    confidence=results["animation_confidence"],
                 )
-                logger.info("Animation saved: %s", gif_path)
 
-    # Save per-step conditional probabilities
-    if stored_probs:
-        probs_dir = os.path.join(outdir, "probabilities")
-        os.makedirs(probs_dir, exist_ok=True)
-        logger.info("Saving probabilities for %d (prompt, replica) pairs to %s",
-                     len(stored_probs), probs_dir)
-        for (p_idx, r_idx), probs_array in stored_probs.items():
-            # probs_array shape: [steps, seq_len, num_classes]
-            npz_path = os.path.join(probs_dir, f"prompt_{p_idx}_replica_{r_idx}.npz")
-            np.savez_compressed(
-                npz_path,
-                probs=probs_array,
-                tokens=tokens,
-                final_frame=stored_final_frames[(p_idx, r_idx)],
+            if not getattr(config_args_parser, 'no_gif', False):
+                animation_style = getattr(config_args_parser, 'animation_style', 'brightness')
+                requested_metrics = getattr(config_args_parser, 'animation_metrics', None) or []
+                if (animation_style != 'brightness' or requested_metrics) and not stored_probs:
+                    logger.warning("--animation_style=%s / --animation_metrics requires "
+                                   "--store_probabilities; falling back to default animation",
+                                   animation_style)
+                logger.info("Saving %d GIF animation(s) to %s", len(animation_frames), animation_dir)
+                for (p_idx, r_idx), frames in animation_frames.items():
+                    gif_path = os.path.join(animation_dir, f"prompt_{p_idx}_replica_{r_idx}.gif")
+                    frame_probs = stored_probs.get((p_idx, r_idx)) if stored_probs else None
+
+                    # Build metric annotations for this (prompt, replica)
+                    metrics = []
+                    if frame_probs is not None and requested_metrics:
+                        for name in requested_metrics:
+                            if name == "confidence":
+                                metrics.append(
+                                    Stage3_ani_tools.confidence_metric(frame_probs))
+                            else:
+                                logger.warning("Unknown animation metric %r, skipping", name)
+
+                    Stage3_ani_tools.generate_sequence_animation(
+                        frames=frames,
+                        tokens=tokens,
+                        output_path=gif_path,
+                        probs=frame_probs,
+                        prob_style=animation_style,
+                        metrics=metrics or None,
+                        title=f"Prompt {p_idx} \u00b7 Replica {r_idx}",
+                    )
+                    logger.info("Animation saved: %s", gif_path)
+
+        # Save per-step conditional probabilities
+        if stored_probs:
+            probs_dir = os.path.join(outdir, "probabilities")
+            os.makedirs(probs_dir, exist_ok=True)
+            logger.info("Saving probabilities for %d (prompt, replica) pairs to %s",
+                         len(stored_probs), probs_dir)
+            for (p_idx, r_idx), probs_array in stored_probs.items():
+                # probs_array shape: [steps, seq_len, num_classes]
+                npz_path = os.path.join(probs_dir, f"prompt_{p_idx}_replica_{r_idx}.npz")
+                np.savez_compressed(
+                    npz_path,
+                    probs=probs_array,
+                    tokens=tokens,
+                    final_frame=stored_final_frames[(p_idx, r_idx)],
+                )
+                logger.info("Probabilities saved: %s (shape=%s)", npz_path, probs_array.shape)
+
+        # Write manifest (rank 0 only)
+        elapsed = datetime.now() - start_time
+        if _setup_logging and rank == 0:
+            write_manifest(
+                args, outdir, start_time, elapsed,
+                outputs={
+                    "num_prompts": num_prompts,
+                    "num_replicas": config_args.num_replicas,
+                    "seed": seed,
+                    "unmasking_order": config_args.unmasking_order,
+                    "token_strategy": config_args.token_strategy,
+                    "total_sequences": num_prompts * config_args.num_replicas,
+                    "output_file": os.path.abspath(args.output_path),
+                },
+                resolved_paths={
+                    "input_path": os.path.abspath(args.input_path),
+                    "model_path": os.path.abspath(args.model_path),
+                    "json_config": os.path.abspath(args.config_path),
+                },
+                config_contents=raw_config,
             )
-            logger.info("Probabilities saved: %s (shape=%s)", npz_path, probs_array.shape)
-
-    # Write manifest and clean up logging (rank 0 only)
-    elapsed = datetime.now() - start_time
-    if _setup_logging and rank == 0:
-        write_manifest(
-            args, outdir, start_time, elapsed,
-            outputs={
-                "num_prompts": num_prompts,
-                "num_replicas": config_args.num_replicas,
-                "seed": seed,
-                "unmasking_order": config_args.unmasking_order,
-                "token_strategy": config_args.token_strategy,
-                "total_sequences": num_prompts * config_args.num_replicas,
-                "output_file": os.path.abspath(args.output_path),
-            },
-            resolved_paths={
-                "input_path": os.path.abspath(args.input_path),
-                "model_path": os.path.abspath(args.model_path),
-                "json_config": os.path.abspath(args.config_path),
-            },
-            config_contents=raw_config,
-        )
-        logger.info("Done in %s", elapsed)
+            logger.info("Done in %s", elapsed)
+    finally:
         teardown_file_logging("biom3", file_handler)
 
     # Hold non-rank-0 processes until rank-0 finishes I/O so the launcher

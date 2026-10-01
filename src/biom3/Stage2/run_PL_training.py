@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from biom3.backend.device import BACKEND_NAME, _XPU, setup_logger, set_float32_matmul_precision
+from biom3.backend.device import DEVICE_CHOICES, resolve_device, check_devices_per_node
 
 if BACKEND_NAME == _XPU:
     import lightning as pl
@@ -143,9 +144,10 @@ def get_args(parser):
                         help="fp32 matmul precision. 'medium' (default) uses the bf16 "
                              "path; 'high' uses TF32 tensor cores; 'highest' keeps full "
                              "fp32. CLI overrides the config value.")
-    parser.add_argument('--device', type=str, default='cuda',
-                        choices=['cuda', 'xpu', 'cpu'],
-                        help='Compute device for training.')
+    parser.add_argument('--device', type=str, default='auto',
+                        choices=list(DEVICE_CHOICES),
+                        help='Compute device for training; auto = the detected '
+                             'GPU backend (CUDA, then XPU; never falls back to CPU).')
     parser.add_argument('--devices_per_node', type=int, default=None,
                         help='Number of GPUs (CUDA) or tiles (XPU) per node. Default 1.')
     parser.add_argument('--gpu_devices', type=int, default=None,
@@ -573,6 +575,13 @@ def main(args):
     warnings.filterwarnings("ignore", message=".*TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD.*")
     logging.getLogger("tensorboardX.x2num").setLevel(logging.ERROR)
 
+    # A dry run only probes config, data and model, so it may land on CPU; a
+    # real run must find a GPU unless --device cpu was asked for explicitly.
+    dry_run = getattr(args, 'dry_run', False)
+    args.device = resolve_device(args.device, allow_cpu=dry_run)
+    if not dry_run:
+        check_devices_per_node(args.device, args.devices_per_node)
+
     if getattr(args, 'dry_run', False):
         return run_dry_run(
             args,
@@ -589,103 +598,103 @@ def main(args):
         os.makedirs(logs_dir, exist_ok=True)
         os.makedirs(artifacts_dir, exist_ok=True)
     log_path, file_handler = setup_file_logging(artifacts_dir)
+    try:
+        set_float32_matmul_precision(args.float32_matmul_precision)
+        clear_gpu_cache()
 
-    set_float32_matmul_precision(args.float32_matmul_precision)
-    clear_gpu_cache()
+        seed = args.seed
+        if seed <= 0:
+            seed = np.random.randint(2 ** 32)
+            args.seed = seed
+        set_seed(seed)
+        logger.info("Using seed: %s", seed)
 
-    seed = args.seed
-    if seed <= 0:
-        seed = np.random.randint(2 ** 32)
-        args.seed = seed
-    set_seed(seed)
-    logger.info("Using seed: %s", seed)
+        data_module = load_data(args)
+        PL_model = build_pl_model(args)
+        logger.info("Facilitator parameters: %s", sum(p.numel() for p in PL_model.model.parameters()))
 
-    data_module = load_data(args)
-    PL_model = build_pl_model(args)
-    logger.info("Facilitator parameters: %s", sum(p.numel() for p in PL_model.model.parameters()))
+        if args.pretrained_weights is not None and os.path.exists(args.pretrained_weights):
+            PL_model = load_pretrained_weights(PL_model, args.pretrained_weights)
+        elif args.pretrained_weights is not None:
+            logger.warning("Pretrained weights path does not exist: %s", args.pretrained_weights)
 
-    if args.pretrained_weights is not None and os.path.exists(args.pretrained_weights):
-        PL_model = load_pretrained_weights(PL_model, args.pretrained_weights)
-    elif args.pretrained_weights is not None:
-        logger.warning("Pretrained weights path does not exist: %s", args.pretrained_weights)
+        trainer, artifacts_dir = train_model(args, PL_model, data_module)
 
-    trainer, artifacts_dir = train_model(args, PL_model, data_module)
+        # ---- Final predict pass + save transformed embeddings ----
+        if get_global_rank() == 0:
+            if args.swissprot_data_path_sentinel != 'None' and data_module.all_swiss_dataloader is not None:
+                logger.info("Infer SwissProt dataset...")
+                preds = get_final_embeddings(
+                    PL_model, data_module.all_swiss_dataloader,
+                    device=args.device, devices=1,
+                )
+                if args.output_swissprot_dict_path:
+                    save_embeddings(
+                        data_module.swissprot_data, preds, args.output_swissprot_dict_path,
+                    )
 
-    # ---- Final predict pass + save transformed embeddings ----
-    if get_global_rank() == 0:
-        if args.swissprot_data_path_sentinel != 'None' and data_module.all_swiss_dataloader is not None:
-            logger.info("Infer SwissProt dataset...")
-            preds = get_final_embeddings(
-                PL_model, data_module.all_swiss_dataloader,
-                device=args.device, devices=1,
-            )
+            if args.pfam_data_path_sentinel != 'None' and data_module.all_pfam_dataloader is not None:
+                logger.info("Infer Pfam dataset...")
+                preds = get_final_embeddings(
+                    PL_model, data_module.all_pfam_dataloader,
+                    device=args.device, devices=1,
+                )
+                if args.output_pfam_dict_path:
+                    save_embeddings(
+                        data_module.pfam_data, preds, args.output_pfam_dict_path,
+                    )
+
+        # ---- Manifest + args.json ----
+        if get_global_rank() == 0:
+            elapsed = datetime.now() - start_time
+            args_path = os.path.join(artifacts_dir, "args.json")
+            backup_if_exists(args_path)
+            with open(args_path, "w") as f:
+                json.dump({k: v for k, v in vars(args).items() if not k.startswith("_")},
+                          f, indent=2, default=str)
+
+            total_params = sum(p.numel() for p in PL_model.model.parameters())
+            outputs = {
+                "seed": args.seed,
+                "total_params": total_params,
+                "batch_size": args.batch_size,
+                "effective_lr": args.lr,
+                "precision": args.precision,
+                "devices_per_node": args.devices_per_node,
+                "num_nodes": args.num_nodes,
+                "acc_grad_batches": args.acc_grad_batches,
+                "epochs": args.epochs,
+                "loss_type": args.loss_type,
+                "emb_dim": args.emb_dim,
+                "hid_dim": args.hid_dim,
+            }
+
+            resolved_paths = {
+                "checkpoint_dir": os.path.abspath(checkpoint_dir),
+                "artifacts_dir": os.path.abspath(artifacts_dir),
+            }
+            if args.swissprot_data_path is not None:
+                resolved_paths["swissprot_data_path"] = os.path.abspath(args.swissprot_data_path)
+            if args.pfam_data_path is not None:
+                resolved_paths["pfam_data_path"] = os.path.abspath(args.pfam_data_path)
             if args.output_swissprot_dict_path:
-                save_embeddings(
-                    data_module.swissprot_data, preds, args.output_swissprot_dict_path,
-                )
-
-        if args.pfam_data_path_sentinel != 'None' and data_module.all_pfam_dataloader is not None:
-            logger.info("Infer Pfam dataset...")
-            preds = get_final_embeddings(
-                PL_model, data_module.all_pfam_dataloader,
-                device=args.device, devices=1,
-            )
+                resolved_paths["output_swissprot_dict_path"] = os.path.abspath(args.output_swissprot_dict_path)
             if args.output_pfam_dict_path:
-                save_embeddings(
-                    data_module.pfam_data, preds, args.output_pfam_dict_path,
-                )
+                resolved_paths["output_pfam_dict_path"] = os.path.abspath(args.output_pfam_dict_path)
+            if args.pretrained_weights is not None:
+                resolved_paths["pretrained_weights"] = os.path.abspath(args.pretrained_weights)
+            if args.resume_from_checkpoint is not None:
+                resolved_paths["resume_from_checkpoint"] = os.path.abspath(args.resume_from_checkpoint)
 
-    # ---- Manifest + args.json ----
-    if get_global_rank() == 0:
-        elapsed = datetime.now() - start_time
-        args_path = os.path.join(artifacts_dir, "args.json")
-        backup_if_exists(args_path)
-        with open(args_path, "w") as f:
-            json.dump({k: v for k, v in vars(args).items() if not k.startswith("_")},
-                      f, indent=2, default=str)
-
-        total_params = sum(p.numel() for p in PL_model.model.parameters())
-        outputs = {
-            "seed": args.seed,
-            "total_params": total_params,
-            "batch_size": args.batch_size,
-            "effective_lr": args.lr,
-            "precision": args.precision,
-            "devices_per_node": args.devices_per_node,
-            "num_nodes": args.num_nodes,
-            "acc_grad_batches": args.acc_grad_batches,
-            "epochs": args.epochs,
-            "loss_type": args.loss_type,
-            "emb_dim": args.emb_dim,
-            "hid_dim": args.hid_dim,
-        }
-
-        resolved_paths = {
-            "checkpoint_dir": os.path.abspath(checkpoint_dir),
-            "artifacts_dir": os.path.abspath(artifacts_dir),
-        }
-        if args.swissprot_data_path is not None:
-            resolved_paths["swissprot_data_path"] = os.path.abspath(args.swissprot_data_path)
-        if args.pfam_data_path is not None:
-            resolved_paths["pfam_data_path"] = os.path.abspath(args.pfam_data_path)
-        if args.output_swissprot_dict_path:
-            resolved_paths["output_swissprot_dict_path"] = os.path.abspath(args.output_swissprot_dict_path)
-        if args.output_pfam_dict_path:
-            resolved_paths["output_pfam_dict_path"] = os.path.abspath(args.output_pfam_dict_path)
-        if args.pretrained_weights is not None:
-            resolved_paths["pretrained_weights"] = os.path.abspath(args.pretrained_weights)
-        if args.resume_from_checkpoint is not None:
-            resolved_paths["resume_from_checkpoint"] = os.path.abspath(args.resume_from_checkpoint)
-
-        manifest_path = write_manifest(
-            args, artifacts_dir, start_time, elapsed,
-            outputs=outputs,
-            resolved_paths=resolved_paths,
-            environment=collect_training_env(),
-        )
-        logger.info("Build manifest written to %s", manifest_path)
-
-    teardown_file_logging("biom3", file_handler)
+            manifest_path = write_manifest(
+                args, artifacts_dir, start_time, elapsed,
+                outputs=outputs,
+                resolved_paths=resolved_paths,
+                environment=collect_training_env(),
+            )
+            logger.info("Build manifest written to %s", manifest_path)
+    finally:
+        teardown_file_logging("biom3", file_handler)
 
 
 _DRY_RUN_CACHE = {}

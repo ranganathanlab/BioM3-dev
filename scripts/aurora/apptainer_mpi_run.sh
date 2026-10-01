@@ -26,18 +26,23 @@
 #
 # EXAMPLES:
 #   # single node, 12 tiles (use this first to validate the path)
-#   NGPU_PER_NODE=12 NGPU_TOTAL=12 \
-#   BIOM3_SIF=/flare/.../biom3_xpu-<sha>.sif \
+#   NGPU_PER_NODE=12 NGPU_TOTAL=12 BIOM3_RANK_SOURCE=mpi \
+#   BIOM3_IMAGE=/flare/NLDesignProtein/$USER/biom3_xpu-oneapi.sif \
 #   scripts/aurora/apptainer_mpi_run.sh \
 #       biom3_train_stage3 --config_path configs/stage3_training/pretrain_scratch_v1.json \
-#       --device xpu --devices_per_node 12 --num_nodes 1 --run_id mpi001
+#       --device auto --devices_per_node 12 --num_nodes 1 --run_id mpi001
 #
 #   # two nodes, 24 tiles
 #   NGPU_PER_NODE=12 NGPU_TOTAL=24 ... (same, --num_nodes 2 --run_id mpi002)
 #
+#   BIOM3_RANK_SOURCE=mpi is the native path for the xpu-oneapi image, whose
+#   Intel MPI matches the launcher's; every example here uses it. The `pals`
+#   default is for the xpu image, which has no such MPI. See BIOM3_RANK_SOURCE
+#   under ENV below.
+#
 #   # GDPO on two nodes: ONE rank per node, each owning all 12 local tiles
-#   NGPU_PER_NODE=1 NGPU_TOTAL=2 BIOM3_RANK_LAYOUT=node \
-#   BIOM3_SIF=/flare/.../biom3_xpu-oneapi-<sha>.sif \
+#   NGPU_PER_NODE=1 NGPU_TOTAL=2 BIOM3_RANK_LAYOUT=node BIOM3_RANK_SOURCE=mpi \
+#   BIOM3_IMAGE=/flare/NLDesignProtein/$USER/biom3_xpu-oneapi.sif \
 #   scripts/aurora/apptainer_mpi_run.sh biom3_gdpo_train --config_path configs/grpo/...
 #
 # ENV:
@@ -45,16 +50,22 @@
 #   NGPU_TOTAL         total ranks across all nodes (required)
 #   BIOM3_RANK_LAYOUT  tile (default) = 1 rank/tile, Stage 3 train + generate;
 #                      node = 1 rank/node with all 12 tiles, GDPO/GRPO
+#   BIOM3_RANK_SOURCE  mpi = Lightning's MPIEnvironment via mpi4py, the native
+#                      path for xpu-oneapi; pals (default) translates the PALS
+#                      rank vars into torch's for images without a matching MPI
 #   PBS_NODEFILE       set by PBS; required for >1 node
-#   BIOM3_SIF          path to the .sif (default: ./biom3_xpu.sif)
-#   BIOM3_WEIGHTS_DIR  host weights dir bound to /app/weights (ro)
-#   BIOM3_DATA_DIR     host data dir    bound to /app/data    (ro)
-#   BIOM3_OUTPUTS_DIR  host outputs dir bound to /app/outputs (rw; default ./outputs)
-#   BIOM3_CONFIGS_DIR  host configs dir bound to /app/configs (ro)
-#   BIOM3_BIND_EXTRA   extra colon/comma paths to --bind
+#   BIOM3_IMAGE        path to the .sif (default: ./biom3_xpu.sif; the older
+#                      BIOM3_SIF is still read)
+#   BIOM3_WEIGHTS_DIR, BIOM3_DATA_DIR, BIOM3_OUTPUTS_DIR, BIOM3_TESTS_TMP,
+#   BIOM3_CONFIGS_DIR, BIOM3_BIND_EXTRA
+#                      mounts, shared with docker/run.sh: see
+#                      scripts/_container_mounts.sh
 #   BIOM3_FI_PROVIDER  libfabric provider (default tcp; see the CXI note below)
 #   BIOM3_FABRIC_DIR   host libfabric to bind over the container's (CXI; below)
 #   BIOM3_PMIX         host PMIx library (default /usr/lib64/libpmix.so.2)
+#   BIOM3_CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK
+#                      CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK (default 0; see
+#                      apptainer_run.sh)
 #   WANDB_API_KEY      forwarded into the container if set
 #
 # CXI: the default provider is tcp, which works across nodes but does not use
@@ -71,10 +82,13 @@
 set -euo pipefail
 
 [[ $# -ge 1 ]] || { echo "USAGE: $0 <command...>   (see --help header)" >&2; exit 1; }
-[[ "$1" == "-h" || "$1" == "--help" ]] && { sed -n '3,57p' "$0"; exit 0; }
+[[ "$1" == "-h" || "$1" == "--help" ]] && { sed -n '3,/^#====/p' "$0"; exit 0; }
 
-SIF="${BIOM3_SIF:-./biom3_xpu.sif}"
-[[ -f "${SIF}" ]] || { echo "ERROR: sif '${SIF}' not found; set BIOM3_SIF." >&2; exit 1; }
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/../_container_mounts.sh"
+
+SIF="${BIOM3_IMAGE:-${BIOM3_SIF:-./biom3_xpu.sif}}"
+[[ -f "${SIF}" ]] || { echo "ERROR: sif '${SIF}' not found; set BIOM3_IMAGE." >&2; exit 1; }
 
 command -v mpiexec >/dev/null 2>&1 || { echo "ERROR: mpiexec not found (host MPI)." >&2; exit 1; }
 command -v apptainer >/dev/null 2>&1 || { echo "ERROR: apptainer not found; module load apptainer." >&2; exit 1; }
@@ -84,9 +98,6 @@ NGPU_TOTAL="${NGPU_TOTAL:?NGPU_TOTAL env var required}"
 
 PMIX="${BIOM3_PMIX:-/usr/lib64/libpmix.so.2}"
 [[ -f "${PMIX}" ]] || { echo "ERROR: PMIx library '${PMIX}' not found; set BIOM3_PMIX." >&2; exit 1; }
-
-O="${BIOM3_OUTPUTS_DIR:-$PWD/outputs}"
-mkdir -p "${O}"
 
 # --- Binds ---------------------------------------------------------------
 # Do NOT bind /dev/dri: apptainer mounts /dev by default, and adding it as a
@@ -101,7 +112,8 @@ mkdir -p "${O}"
 # Binding only /flare leaves every one of them dangling inside the container --
 # which surfaces far from the cause, e.g. transformers reporting a local model
 # directory as a malformed Hub repo id.
-BINDS=("/flare" "${O}:/app/outputs" "${PMIX}:/hostlib/libpmix.so.2" "/usr/lib64:/hostevent")
+biom3_container_mounts || exit 1
+BINDS=("/flare" "${MOUNTS[@]}" "${PMIX}:/hostlib/libpmix.so.2" "/usr/lib64:/hostevent")
 [[ -d /lus ]] && BINDS+=("/lus")
 
 # BIOM3_FABRIC_DIR binds a host libfabric over the container's, so cross-node
@@ -123,10 +135,6 @@ if [[ -n "${BIOM3_FABRIC_DIR:-}" ]]; then
         exit 1; }
     BINDS+=("${BIOM3_FABRIC_DIR}:/hostfabric:ro")
 fi
-[[ -n "${BIOM3_WEIGHTS_DIR:-}" ]] && BINDS+=("${BIOM3_WEIGHTS_DIR}:/app/weights:ro")
-[[ -n "${BIOM3_DATA_DIR:-}"    ]] && BINDS+=("${BIOM3_DATA_DIR}:/app/data:ro")
-[[ -n "${BIOM3_CONFIGS_DIR:-}" ]] && BINDS+=("${BIOM3_CONFIGS_DIR}:/app/configs:ro")
-[[ -n "${BIOM3_BIND_EXTRA:-}"  ]] && BINDS+=("${BIOM3_BIND_EXTRA}")
 BIND_ARG="$(IFS=,; echo "${BINDS[*]}")"
 
 # --- Env into each rank's container ---------------------------------------
@@ -141,7 +149,8 @@ ENVS=(--env "ZE_FLAT_DEVICE_HIERARCHY=FLAT"
       --env "FI_PROVIDER=${BIOM3_FI_PROVIDER:-tcp}"
       --env "I_MPI_PMI_LIBRARY=/hostlib/libpmix.so.2"
       --env "CCL_ZE_IPC_EXCHANGE=${BIOM3_CCL_ZE_IPC_EXCHANGE:-sockets}"
-      --env "CCL_ATL_TRANSPORT=${BIOM3_CCL_ATL_TRANSPORT:-mpi}")
+      --env "CCL_ATL_TRANSPORT=${BIOM3_CCL_ATL_TRANSPORT:-mpi}"
+      --env "CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=${BIOM3_CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK:-0}")
 
 # CCL_ATL_TRANSPORT=mpi (oneCCL's own default) rather than the ofi that ALCF's
 # recipe sets. Their recipe has no usable MPI inside the container, so oneCCL
@@ -175,6 +184,12 @@ ENVS=(--env "ZE_FLAT_DEVICE_HIERARCHY=FLAT"
 [[ -n "${BIOM3_FABRIC_DIR:-}" ]] && ENVS+=(--env "I_MPI_OFI_LIBRARY_INTERNAL=0")
 
 [[ -n "${WANDB_API_KEY:-}" ]] && ENVS+=(--env "WANDB_API_KEY=${WANDB_API_KEY}")
+
+# The lightning fork imports pkg_resources, whose deprecation notice every rank
+# would print. Only when the caller has no PYTHONWARNINGS of their own: apptainer
+# splits --env values on commas, so the two cannot be combined.
+[[ -z "${PYTHONWARNINGS:-}" ]] && \
+    ENVS+=(--env "PYTHONWARNINGS=ignore:pkg_resources is deprecated as an API")
 
 # --- Rank layout ----------------------------------------------------------
 # Which of the two shapes on Aurora this run uses. The container equivalent of
@@ -248,19 +263,22 @@ ENVS+=(--env "BIOM3_WORLD_SIZE=${NGPU_TOTAL}")
 # these and reports creates_processes_externally=True, which is accurate here:
 # mpiexec already created the processes.
 #
-# BIOM3_RANK_SOURCE=mpi skips the translation entirely and lets MPIEnvironment
+# BIOM3_RANK_SOURCE=mpi skips the per-rank translation and lets MPIEnvironment
 # detect via mpi4py, which is the native path and only works in an image whose
-# MPI matches the launcher's (Dockerfile.xpu-oneapi). Note TorchElasticEnvironment
-# is checked BEFORE MPIEnvironment, so the variables below suppress it.
-# BIOM3_SETVARS=1 puts the base oneAPI's MPI libraries ahead of pip's. Required
-# for Dockerfile.xpu-oneapi, which has two Intel MPIs: the base's (what mpi4py
-# was compiled against) and pip's impi-rt, pulled in as a dependency. Left to
-# itself the loader mixes them and mpi4py fails with
+# MPI matches the launcher's (Dockerfile.xpu-oneapi). WORLD_SIZE is exported
+# either way: biom3.core.distributed reads it, while Lightning picks its
+# environment from TORCHELASTIC_RUN_ID and mpi4py, neither of which it affects.
+# BIOM3_SETVARS=1 puts the base oneAPI's MPI libraries ahead of pip's. The
+# xpu-oneapi image has two Intel MPIs: the base's (what mpi4py was compiled
+# against) and pip's impi-rt, pulled in by torch. If their versions differ the
+# loader mixes them and mpi4py fails with
 #   libmpifort.so.12: undefined symbol: MPIR_F_MPI_BUFFER_AUTOMATIC
+# In the current image they match (see Dockerfile.xpu-oneapi), so multi-node
+# runs do not need this; it is for an image where they drift apart.
 #
 # Only the MPI directories, NOT setvars.sh. Sourcing setvars also puts the base's
-# oneAPI 2025.3 compiler runtime first, which is not the one the pip torch was
-# built against, and torch then fails to import with
+# oneAPI compiler runtime first, which breaks a pip torch built against a
+# different one, e.g.
 #   libur_loader.so.0: version `LIBUR_LOADER_0.11' not found (by libsycl.so.8)
 # Leave unset for Dockerfile.xpu, which has no oneAPI installation.
 SETVARS=""
@@ -297,13 +315,12 @@ export LD_LIBRARY_PATH="/hostfabric:${LD_LIBRARY_PATH}"
 '
 fi
 
-if [[ "${BIOM3_RANK_SOURCE:-pals}" == "mpi" ]]; then
-    RANK_XLATE=""
-else
-    RANK_XLATE='export RANK="${PALS_RANKID:?PALS_RANKID not set; was this launched by mpiexec?}"
+RANK_XLATE='export WORLD_SIZE="${BIOM3_WORLD_SIZE:?BIOM3_WORLD_SIZE not set}"
+'
+if [[ "${BIOM3_RANK_SOURCE:-pals}" != "mpi" ]]; then
+    RANK_XLATE+='export RANK="${PALS_RANKID:?PALS_RANKID not set; was this launched by mpiexec?}"
 export LOCAL_RANK="${PALS_LOCAL_RANKID:?PALS_LOCAL_RANKID not set}"
 export LOCAL_WORLD_SIZE="${PALS_LOCAL_SIZE:?PALS_LOCAL_SIZE not set}"
-export WORLD_SIZE="${BIOM3_WORLD_SIZE:?BIOM3_WORLD_SIZE not set}"
 export GROUP_RANK=$(( RANK / LOCAL_WORLD_SIZE ))
 export NODE_RANK="${GROUP_RANK}"
 export TORCHELASTIC_RUN_ID="${TORCHELASTIC_RUN_ID:-biom3-mpi}"
@@ -334,6 +351,13 @@ ${LAYOUT_POST}"'exec "$@"'
 # settings apply; the --env values above win over anything it sets.
 set -- bash -lc "${PRELUDE}" _ "$@"
 
+# Apptainer warns, once per rank, about every host variable that an --env above
+# replaces. The host values are wrong inside the container, so drop them before
+# mpiexec forwards this environment (--envall) to the ranks.
+for e in "${ENVS[@]}"; do [[ "${e}" == --env ]] || unset "${e%%=*}"; done
+
+# `--quiet` drops apptainer's INFO lines (e.g. "gocryptfs not found"); its
+# warnings and errors still print.
 echo "+ mpiexec ${MPI_ARGS[*]} apptainer exec --writable-tmpfs --bind ${BIND_ARG} ${SIF} <cmd>" >&2
 exec mpiexec "${MPI_ARGS[@]}" \
-    apptainer exec --writable-tmpfs --bind "${BIND_ARG}" "${ENVS[@]}" "${SIF}" "$@"
+    apptainer --quiet exec --writable-tmpfs --bind "${BIND_ARG}" "${ENVS[@]}" "${SIF}" "$@"

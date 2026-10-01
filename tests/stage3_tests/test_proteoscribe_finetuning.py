@@ -59,9 +59,9 @@ _NO_DROPOUT_SCHEMA = {
 
 
 class _FakeTokenizer:
-    """Minimal stand-in for a HF tokenizer's batch_encode_plus."""
+    """Minimal stand-in for calling a HF tokenizer on a batch."""
 
-    def batch_encode_plus(self, prompts, *, truncation, max_length, padding,
+    def __call__(self, prompts, *, truncation, max_length, padding,
                           return_tensors, return_attention_mask,
                           return_token_type_ids):
         assert padding == "max_length"

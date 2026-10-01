@@ -1,0 +1,8 @@
+{
+  "name": "biom3-datasets-gfp_demo",
+
+  "data": {
+    "gfp_sample_dataset.csv": "data/gfp_sample_dataset.csv",
+    "gfp_sample_dataset.NOTICE.md": "data/gfp_sample_dataset.NOTICE.md"
+  }
+}

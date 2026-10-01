@@ -69,51 +69,53 @@ def main(args, _setup_logging=True):
     file_handler = None
     if _setup_logging:
         log_path, file_handler = setup_file_logging(outdir)
-    start_time = datetime.now()
-    logger.info("=" * 60)
-    logger.info("Compile Stage 2 data to HDF5")
-    logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
-    logger.info("Command:     %s", " ".join(sys.argv))
-    logger.info("=" * 60)
+    try:
+        start_time = datetime.now()
+        logger.info("=" * 60)
+        logger.info("Compile Stage 2 data to HDF5")
+        logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
+        logger.info("Command:     %s", " ".join(sys.argv))
+        logger.info("=" * 60)
 
-    input_data = torch.load(args.input_data_path, weights_only=False)
+        input_data = torch.load(args.input_data_path, weights_only=False)
 
-    sequences = input_data[INPUT_KEYS["SEQUENCE"]]
-    acc_ids = input_data[INPUT_KEYS["ACCESSION_ID"]]
-    text_to_protein_embedding = input_data[INPUT_KEYS["FACILITATOR_EMBEDDING"]].cpu()
-    sequence_length = np.array([len(seq) for seq in sequences], dtype=int)
+        sequences = input_data[INPUT_KEYS["SEQUENCE"]]
+        acc_ids = input_data[INPUT_KEYS["ACCESSION_ID"]]
+        text_to_protein_embedding = input_data[INPUT_KEYS["FACILITATOR_EMBEDDING"]].cpu()
+        sequence_length = np.array([len(seq) for seq in sequences], dtype=int)
 
-    data_out = {
-        "ACCESSION_ID": acc_ids,
-        "SEQUENCE": sequences,
-        "SEQUENCE_LENGTH": sequence_length,
-        "FACILITATOR_EMBEDDING": text_to_protein_embedding,
-    }
+        data_out = {
+            "ACCESSION_ID": acc_ids,
+            "SEQUENCE": sequences,
+            "SEQUENCE_LENGTH": sequence_length,
+            "FACILITATOR_EMBEDDING": text_to_protein_embedding,
+        }
 
-    with h5py.File(args.output_path, "w") as outfile:
-        outfile.create_group(args.dataset_key)
-        for k, output_key in OUTPUT_KEYS.items():
-            outfile.create_dataset(
-                f"{args.dataset_key}/{output_key}",
-                data=data_out[k],
+        with h5py.File(args.output_path, "w") as outfile:
+            outfile.create_group(args.dataset_key)
+            for k, output_key in OUTPUT_KEYS.items():
+                outfile.create_dataset(
+                    f"{args.dataset_key}/{output_key}",
+                    data=data_out[k],
+                )
+
+        logger.info("Compiled HDF5 saved to %s (group: %s, %s samples)",
+                    args.output_path, args.dataset_key, len(sequences))
+
+        # Write manifest
+        elapsed = datetime.now() - start_time
+        if _setup_logging:
+            write_manifest(
+                args, outdir, start_time, elapsed,
+                outputs={
+                    "num_samples": len(sequences),
+                    "dataset_key": args.dataset_key,
+                    "output_file": os.path.abspath(args.output_path),
+                },
+                resolved_paths={
+                    "input_data_path": os.path.abspath(args.input_data_path),
+                },
             )
-
-    logger.info("Compiled HDF5 saved to %s (group: %s, %s samples)",
-                args.output_path, args.dataset_key, len(sequences))
-
-    # Write manifest and clean up logging
-    elapsed = datetime.now() - start_time
-    if _setup_logging:
-        write_manifest(
-            args, outdir, start_time, elapsed,
-            outputs={
-                "num_samples": len(sequences),
-                "dataset_key": args.dataset_key,
-                "output_file": os.path.abspath(args.output_path),
-            },
-            resolved_paths={
-                "input_data_path": os.path.abspath(args.input_data_path),
-            },
-        )
-        logger.info("Done in %s", elapsed)
+            logger.info("Done in %s", elapsed)
+    finally:
         teardown_file_logging("biom3", file_handler)

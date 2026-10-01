@@ -37,6 +37,10 @@ TRAIN_METRICS = {
     "train_loss_intra": "train_loss_intra",           # L_PFC
     "train_loss_text_mask": "train_loss_text_mask",   # L_bML
     "train_loss_seq_mask": "train_loss_seq_mask",     # L_pML
+    # L_unif, logged whenever --uniformity_weight > 0 or --log_uniformity.
+    # Absent keys are skipped, so this is inert on runs without it.
+    "train_loss_unif_protein": "train_loss_unif_protein",
+    "train_loss_unif_text": "train_loss_unif_text",
     "train_text_accuracy": "train_text_accuracy",
     "train_text_f1": "train_text_f1",
     "train_seq_accuracy": "train_seq_accuracy",
@@ -51,6 +55,8 @@ VAL_METRICS = {
     "valid_loss_intra": "val_loss_intra",
     "valid_loss_text_mask": "val_loss_text_mask",
     "valid_loss_seq_mask": "val_loss_seq_mask",
+    "valid_loss_unif_protein": "val_loss_unif_protein",
+    "valid_loss_unif_text": "val_loss_unif_text",
     "valid_text_accuracy": "val_text_accuracy",
     "valid_text_f1": "val_text_f1",
     "valid_seq_accuracy": "val_seq_accuracy",

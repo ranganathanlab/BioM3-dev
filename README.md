@@ -46,9 +46,15 @@ For installation and setup instructions on the following machines, refer to the 
 | Machine | Instructions |
 | ------- | ------------ |
 | Polaris (ALCF) | [setup_polaris.md](./docs/setup/setup_polaris.md) |
+| Polaris (ALCF), container | [setup_polaris_container.md](./docs/setup/setup_polaris_container.md) |
 | Aurora (ALCF) | [setup_aurora.md](./docs/setup/setup_aurora.md) |
+| Aurora (ALCF), container | [setup_aurora_container.md](./docs/setup/setup_aurora_container.md) |
 | DGX Spark | [setup_spark.md](./docs/setup/setup_spark.md) |
 | Docker | [setup_docker.md](./docs/setup/setup_docker.md) |
+
+To run BioM3 from the published container image without cloning this repository at all —
+install Docker, fetch the weights, embed and generate — see
+[docs/setup/user_quickstart.md](./docs/setup/user_quickstart.md).
 
 ## Usage
 
@@ -174,14 +180,13 @@ HPC job templates in `jobs/{polaris,aurora,spark}/` demonstrate how to use these
 biom3_train_stage3 \
     --config_path configs/stage3_training/pretrain_scratch_v2.json \
     --run_id my_run_v1 \
-    --device cuda \
     --epochs 10
 
 # Via multinode wrapper (from an HPC job template). Wandb is auto-resolved
 # from the WANDB_API_KEY env var; pass `--wandb True|False` to override.
 ./scripts/stage3_train_multinode.sh \
     configs/stage3_training/pretrain_scratch_v2.json \
-    2 4 cuda my_run_v1 \
+    2 4 auto my_run_v1 \
     --epochs 10 --wandb True
 ```
 
@@ -196,7 +201,6 @@ Example configs: `configs/stage3_training/finetune_v1.json`, `finetune_v2.json`.
 biom3_train_stage3 \
     --config_path configs/stage3_training/finetune_v1.json \
     --run_id finetune_v1 \
-    --device cuda \
     --pretrained_weights ./weights/ProteoScribe/BioM3_ProteoScribe_pfam_epoch20_v1.bin \
     --finetune_last_n_blocks 1 \
     --finetune_last_n_layers -1
@@ -220,7 +224,7 @@ This stage generates protein sequences from the facilitated text embeddings (`z_
 
 **Arguments:** see [docs/CLI_reference.md#biom3_proteoscribe_sample--stage-3-sequence-generation](./docs/CLI_reference.md#biom3_proteoscribe_sample--stage-3-sequence-generation). Animation, FASTA, and pre-unmask flags are documented there as well.
 
-> **Note:** To control sampling behavior (number of sequences per prompt, batch size, diffusion steps), edit `num_replicas`, `batch_size_sample`, and `diffusion_steps` in the JSON config.
+> **Note:** The number of sequences per prompt is set by `--num_replicas`, which overrides `num_replicas` in the JSON config (default 5 when neither sets it). Batch size and diffusion steps are set by `batch_size_sample` and `diffusion_steps` in the JSON config.
 
 #### Example: standard usage following Stage 2
 

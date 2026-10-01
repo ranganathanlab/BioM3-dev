@@ -1,0 +1,5 @@
+{
+  "description": "Stage 1 uniformity sweep, weight 2.0.",
+  "_base_configs": ["./_base_uniformity_sweep.json"],
+  "uniformity_weight": 2.0
+}

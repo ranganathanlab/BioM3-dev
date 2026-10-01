@@ -188,3 +188,31 @@ def coerce_limit_batches(value):
     if value is None:
         return None
     return int(value) if value > 1 else float(value)
+
+
+def optional_positive_int(value, name="value"):
+    """Coerce a positive-int setting that may be unset, from argparse or JSON.
+
+    ``None``, ``''`` and ``'None'`` (any case) mean unset and return ``None``,
+    so the caller can fall back to its next source. Otherwise accepts an int,
+    an integral float, or an integer string. Usable directly as an argparse
+    ``type=``.
+
+    Raises ValueError for any other value, or one below 1.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value.lower() in ("", "none"):
+            return None
+    invalid = ValueError(f"{name} must be a positive integer, got {value!r}")
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise invalid
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise invalid from None
+    if number < 1:
+        raise invalid
+    return number

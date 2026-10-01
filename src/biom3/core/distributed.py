@@ -27,6 +27,7 @@ from biom3.backend.device import (
 # use it without creating a backend.device <-> core.distributed import
 # cycle. Re-exported below as part of the public surface of this module.
 from biom3.core._dist_env import (  # noqa: F401  (re-exported)
+    _WORLD_SIZE_ENV_VARS,
     get_global_rank,
     get_local_rank,
     get_world_size,
@@ -93,6 +94,18 @@ def init_distributed_if_launched(device: str) -> tuple[int, int, int, str]:
     rank = get_global_rank()
     local_rank = get_local_rank()
     world_size = get_world_size()
+
+    # Rank and world size come from independent env vars, so a launcher that
+    # exports one but not the other yields rank=N with world_size=1. That is not
+    # detectably wrong later: work is sharded as [rank::world_size], so every
+    # rank above 0 silently gets nothing while rank 0 does the whole job.
+    if rank >= world_size:
+        raise RuntimeError(
+            f"Inconsistent launcher environment: rank={rank} but world_size="
+            f"{world_size}. World size is read from "
+            f"{', '.join(_WORLD_SIZE_ENV_VARS)}; set one of them to the total "
+            "rank count."
+        )
 
     resolved_device = _resolve_device_str(device, local_rank)
 

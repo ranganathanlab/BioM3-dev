@@ -74,7 +74,7 @@ class TestAlphaSpecUsesZp:
 # ------------------------------- collate wiring ------------------------------
 
 class _FakeTokenizer:
-    def batch_encode_plus(self, prompts, *, truncation, max_length, padding,
+    def __call__(self, prompts, *, truncation, max_length, padding,
                           return_tensors, return_attention_mask,
                           return_token_type_ids):
         return {"input_ids": torch.zeros(len(prompts), max_length, dtype=torch.long)}

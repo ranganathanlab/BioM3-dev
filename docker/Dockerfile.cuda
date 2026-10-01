@@ -1,4 +1,5 @@
-# BioM3 — NVIDIA CUDA image (biom3:cuda) for commercial cloud (AWS / Mithril).
+# BioM3 — NVIDIA CUDA image (biom3:cuda), for any NVIDIA host with Docker (a
+# workstation, a cloud GPU instance) and, under Apptainer, ALCF Polaris.
 # The Intel-XPU variant is docker/Dockerfile.xpu; the CPU-only inference variant
 # is docker/Dockerfile.cpu.
 #
@@ -25,8 +26,9 @@
 # scope). Build with docker/build.sh, or:
 #   docker buildx build -f docker/Dockerfile.cuda -t biom3:cuda --load .
 #
-# ALCF HPC (Polaris/Aurora) is NOT a target here — those use apptainer and a
-# different software stack (see docs/setup/setup_{polaris,aurora}.md).
+# Polaris runs this same image under Apptainer (scripts/polaris/apptainer_run.sh,
+# docs/setup/setup_polaris_container.md). Aurora is Intel and uses
+# docker/Dockerfile.xpu and docker/Dockerfile.xpu-oneapi.
 
 ARG CUDA_VERSION=12.9.0
 ARG UBUNTU_VERSION=ubuntu24.04
@@ -84,12 +86,6 @@ RUN pip install torch==2.8.0 torchvision \
 WORKDIR /app
 COPY requirements/ /app/requirements/
 RUN pip install -r requirements/spark.txt
-
-# Optional: bake awscli in for the entrypoint's S3 sync hook. Off by default to
-# keep the image cloud-agnostic — the default data path is bind-mounts (no cloud
-# tools needed). Enable with `--build-arg INSTALL_AWSCLI=true`.
-ARG INSTALL_AWSCLI=false
-RUN if [ "$INSTALL_AWSCLI" = "true" ]; then pip install awscli; fi
 
 # BioM3 source. Explicit paths (no `COPY . .`) so we never bake weights/, data/,
 # outputs/, logs/, or jobs/ into the image. configs/ IS baked in: it is tiny,

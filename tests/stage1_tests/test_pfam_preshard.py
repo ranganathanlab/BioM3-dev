@@ -11,6 +11,8 @@ from biom3.Stage1.preprocess import (
     PFAM_SPLITS_MANIFEST, Pfam_DataModule, pfam_splits_status, write_pfam_splits,
 )
 
+pytestmark = pytest.mark.usefixtures("no_process_group")
+
 
 def _pfam(n=103):
     return pd.DataFrame({

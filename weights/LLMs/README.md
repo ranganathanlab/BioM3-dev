@@ -15,6 +15,10 @@ wget https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t33_650M_UR50D.pt
 wget https://dl.fbaipublicfiles.com/fair-esm/regression/esm2_t33_650M_UR50D-contact-regression.pt
 ```
 
+ESM-2 is MIT licensed; `ESM2_LICENSE.md` in this directory is the notice that has
+to travel with any copy we redistribute. PubMedBERT carries its own `LICENSE.md`
+inside its model directory for the same reason.
+
 ### PubMedBERT Model
 
 Make sure large-file storage capabilities are installed in your environment before cloning HuggingFace model card.

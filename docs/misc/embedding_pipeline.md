@@ -57,6 +57,8 @@ Given `--output_dir outputs --prefix mydata`, the pipeline produces:
 - `outputs/mydata.PenCL_emb.pt` -- Stage 1 embeddings
 - `outputs/mydata.Facilitator_emb.pt` -- Stage 2 embeddings
 - `outputs/mydata.compiled_emb.hdf5` -- final HDF5 for finetuning
+- `outputs/mydata.build_manifest.json` -- arguments, weights, and configs used
+- `outputs/mydata.run.log` -- the run's console output
 
 ## Standalone HDF5 Compilation
 

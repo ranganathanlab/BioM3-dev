@@ -32,6 +32,8 @@ def prefix_paths(args):
         args.pfam_data_path = os.path.join(DATDIR, args.pfam_data_path)
     if args.output_root is not None:
         args.output_root = os.path.join(TMPDIR, args.output_root)
+    if args.pfam_splits_dir is not None:
+        args.pfam_splits_dir = os.path.join(TMPDIR, args.pfam_splits_dir)
     if args.pretrained_weights is not None:
         args.pretrained_weights = os.path.join(DATDIR, args.pretrained_weights)
 
@@ -40,6 +42,7 @@ def prefix_paths(args):
     "argstring_fpath, expect_error_context, expected_dataset_type", [
         [f"{ARGS_DIR}/stage1_training_args_scratch_v1.txt", does_not_raise(), "default"],
         [f"{ARGS_DIR}/stage1_training_args_pfam_v1.txt", does_not_raise(), "pfam"],
+        [f"{ARGS_DIR}/stage1_training_args_pfam_uniformity_v1.txt", does_not_raise(), "pfam"],
     ],
 )
 @pytest.mark.parametrize("device", ["cuda", "xpu"])

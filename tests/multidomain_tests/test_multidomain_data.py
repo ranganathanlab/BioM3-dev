@@ -42,7 +42,7 @@ class _FakeTokenizer:
     def __init__(self):
         self.calls = []
 
-    def batch_encode_plus(self, captions, **kwargs):
+    def __call__(self, captions, **kwargs):
         self.calls.append((list(captions), kwargs))
         n = len(captions)
         length = kwargs["max_length"]

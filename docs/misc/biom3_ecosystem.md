@@ -10,7 +10,7 @@ BioM3 is a multi-stage framework for text-guided protein sequence generation ([N
 
 | Repository | Role | Description |
 |------------|------|-------------|
-| [BioM3-dev](https://github.com/addison-nm/BioM3-dev) | Core library | Python package implementing the 3-stage pipeline (PenCL, Facilitator, ProteoScribe), dataset construction (`biom3.dbio`), visualization (`biom3.viz`), and training infrastructure. |
+| [BioM3-dev](https://github.com/ranganathanlab/BioM3-dev) | Core library | Python package implementing the 3-stage pipeline (PenCL, Facilitator, ProteoScribe), dataset construction (`biom3.dbio`), visualization (`biom3.viz`), and training infrastructure. |
 | [BioM3-data-share](https://github.com/natural-machine/BioM3-data-share) | Shared data | Model weights, training datasets, and reference databases. Synced across compute clusters via rsync. Contains download scripts for bioinformatics databases. |
 | [BioM3-workflow-demo](https://github.com/natural-machine/BioM3-workflow-demo) | Demo workflows | End-to-end 8-step pipeline demonstrating finetuning and sequence generation on a protein family, with structure prediction and evaluation. |
 | [BioM3-workspace-template](https://github.com/natural-machine/BioM3-workspace-template) | Workspace setup | GitHub template repository for setting up new BioM3 workspaces with standardized directory structure and configuration. |
@@ -64,7 +64,7 @@ Databases (NR, Pfam, SwissProt, etc.) are downloaded per-machine via scripts in 
 
 ## Version compatibility
 
-BioM3-dev is in active alpha development on the `0.1.0a` track. Formal semantic versioning will be introduced once BioM3-dev reaches a stable release. See [the tags page](https://github.com/addison-nm/BioM3-dev/tags) for the current version.
+BioM3-dev is in active alpha development on the `0.1.0a` track. Formal semantic versioning will be introduced once BioM3-dev reaches a stable release. See [the tags page](https://github.com/ranganathanlab/BioM3-dev/tags) for the current version.
 
 ### Current approach
 

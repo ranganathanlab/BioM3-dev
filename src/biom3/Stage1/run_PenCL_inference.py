@@ -74,6 +74,7 @@ from biom3.core.run_utils import (
     write_manifest,
 )
 from biom3.backend.device import setup_logger, set_float32_matmul_precision
+from biom3.backend.device import DEVICE_CHOICES, resolve_device
 from biom3.core.distributed import (
     barrier,
     init_distributed_if_launched,
@@ -95,8 +96,9 @@ def parse_arguments(args):
     parser.add_argument('-o', '--output_path', type=str, required=True,
                         help="Path to save output embeddings")
     
-    parser.add_argument('--device', type=str, default="cuda", 
-                        choices=["cpu", "cuda", "xpu"], help="available device")
+    parser.add_argument('--device', type=str, default="auto",
+                        choices=list(DEVICE_CHOICES),
+                        help="available device; auto = the detected backend (CUDA, XPU, else CPU)")
     parser.add_argument('--batch_size', type=int, default=32, 
                         help="batch size")
     parser.add_argument('--num_workers', type=int, default=0,
@@ -331,6 +333,7 @@ def _merge_rank_shards(output_path: str, world_size: int):
 
 
 def main(args, _setup_logging=True):
+    args.device = resolve_device(args.device)
     # ----- Suppress noisy library warnings -----
     warnings.filterwarnings("ignore", message=".*TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD.*")
     warnings.filterwarnings("ignore", message=".*has generative capabilities.*")
@@ -355,281 +358,285 @@ def main(args, _setup_logging=True):
     file_handler = None
     if _setup_logging and is_main:
         log_path, file_handler = setup_file_logging(outdir)
-    start_time = datetime.now()
-    logger.info("=" * 60)
-    logger.info("PenCL inference (Stage 1)")
-    logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
-    logger.info("Command:     %s", " ".join(sys.argv))
-    logger.info("=" * 60)
+    try:
+        start_time = datetime.now()
+        logger.info("=" * 60)
+        logger.info("PenCL inference (Stage 1)")
+        logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
+        logger.info("Command:     %s", " ".join(sys.argv))
+        logger.info("=" * 60)
 
-    # Load configuration
-    config_dict = load_json_config(config_args_parser.config_path)
-    raw_config = copy.deepcopy(config_dict)
-    config_args = convert_to_namespace(config_dict)
+        # Load configuration
+        config_dict = load_json_config(config_args_parser.config_path)
+        raw_config = copy.deepcopy(config_dict)
+        config_args = convert_to_namespace(config_dict)
 
-    # The dataset is built from config_args, not from the CLI namespace, so the
-    # padding mode has to be injected here to reach the collate_fn.
-    config_args.text_padding = config_args_parser.text_padding
-    if config_args.text_padding != "max_padding":
-        logger.warning(
-            "text_padding=%s: BioM3 training used max_padding, so z_t is "
-            "off-distribution here, and under dynamic padding z_t also depends "
-            "on batch composition rather than on the caption alone.",
-            config_args.text_padding,
-        )
-
-    # fp32 matmul precision (TF32): CLI overrides config, config default is "high".
-    set_float32_matmul_precision(
-        config_args_parser.float32_matmul_precision
-        or getattr(config_args, "float32_matmul_precision", "high")
-    )
-
-    # Set the device (per-rank when distributed; unchanged single-process)
-    device = torch.device(resolved_device)
-    if world_size > 1:
-        logger.info(
-            "Distributed: rank %d/%d (local_rank %d) on %s",
-            rank, world_size, local_rank, resolved_device,
-        )
-
-    # Infer loading strategy from file extension or specified flag:
-    load_from_checkpoint = load_from_checkpoint or model_path.endswith('.ckpt')
-
-    with torch.serialization.safe_globals([Namespace]):
-        # Load model
-        model = prepare_model(
-            config_args=config_args,
-            model_path=model_path,
-            device=device,
-            load_from_checkpoint=load_from_checkpoint
-        )
-
-        # Load dataset
-        if args.input_data_path.lower() == "none":
-            dataset = load_test_dataset(config_args)
-        else:
-            dataset = load_dataset(
-                args.input_data_path, config_args, 
-                sep=",",
-                quotechar='"',
-                keep_default_na=False,  # empty string instead of nan
+        # The dataset is built from config_args, not from the CLI namespace, so the
+        # padding mode has to be injected here to reach the collate_fn.
+        config_args.text_padding = config_args_parser.text_padding
+        if config_args.text_padding != "max_padding":
+            logger.warning(
+                "text_padding=%s: BioM3 training used max_padding, so z_t is "
+                "off-distribution here, and under dynamic padding z_t also depends "
+                "on batch composition rather than on the caption alone.",
+                config_args.text_padding,
             )
 
-    # Shard by BATCH, not by row: every batch keeps exactly the members it would
-    # have had single-process, so per-row results are unchanged by world size.
-    # (Row-level sharding would repartition batches, and both the ESM batch
-    # converter's padding width and bf16 reduction order depend on batch
-    # contents.) With world_size == 1 this is the original sequential batching.
-    all_batches = [
-        list(range(i, min(i + batch_size, len(dataset))))
-        for i in range(0, len(dataset), batch_size)
-    ]
-    my_batches = all_batches[rank::world_size]
-    if world_size > len(all_batches) and is_main:
-        logger.warning(
-            "world_size=%d exceeds the %d batch(es) available; %d rank(s) will "
-            "sit idle. Lower batch_size or the rank count to use them.",
-            world_size, len(all_batches), world_size - len(all_batches),
-        )
-    if world_size > 1:
-        logger.info(
-            "Rank %d: %d of %d batches (%d rows)",
-            rank, len(my_batches), len(all_batches),
-            sum(len(b) for b in my_batches),
+        # fp32 matmul precision (TF32): CLI overrides config, config default is "high".
+        set_float32_matmul_precision(
+            config_args_parser.float32_matmul_precision
+            or getattr(config_args, "float32_matmul_precision", "high")
         )
 
-    loader = DataLoader(
-        dataset,
-        batch_sampler=my_batches,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=partial(prep.collate_fn, dataset=dataset, include_raw=True),
-    )
+        # Set the device (per-rank when distributed; unchanged single-process)
+        device = torch.device(resolved_device)
+        if world_size > 1:
+            logger.info(
+                "Distributed: rank %d/%d (local_rank %d) on %s",
+                rank, world_size, local_rank, resolved_device,
+            )
 
-    # Run inference and store accession, text, protein sequence, z_t, and z_p
-    z_t_list = []
-    z_p_list = []
-    text_list = []
-    protein_list = []
-    acc_id_list = []
+        # Infer loading strategy from file extension or specified flag:
+        load_from_checkpoint = load_from_checkpoint or model_path.endswith('.ckpt')
 
-    # Determine autocast dtype: use fp16 on CUDA, bf16 on XPU/CPU if available
-    use_amp = device.type in ("cuda", "xpu") and not args.no_amp
-    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
-    logger.info("autocast: %s", amp_dtype if use_amp else "disabled (fp32)")
+        with torch.serialization.safe_globals([Namespace]):
+            # Load model
+            model = prepare_model(
+                config_args=config_args,
+                model_path=model_path,
+                device=device,
+                load_from_checkpoint=load_from_checkpoint
+            )
 
-    index_list = [i for b in my_batches for i in b]
+            # Load dataset
+            if args.input_data_path.lower() == "none":
+                dataset = load_test_dataset(config_args)
+            else:
+                dataset = load_dataset(
+                    args.input_data_path, config_args, 
+                    sep=",",
+                    quotechar='"',
+                    keep_default_na=False,  # empty string instead of nan
+                )
 
-    with torch.inference_mode():
-        for item in tqdm.tqdm(loader, disable=not is_main):
-            x_t, x_p, texts, sequences, accessions = item
-            x_t = x_t.to(device, non_blocking=True)
-            x_p = x_p.to(device, non_blocking=True)
+        # Shard by BATCH, not by row: every batch keeps exactly the members it would
+        # have had single-process, so per-row results are unchanged by world size.
+        # (Row-level sharding would repartition batches, and both the ESM batch
+        # converter's padding width and bf16 reduction order depend on batch
+        # contents.) With world_size == 1 this is the original sequential batching.
+        all_batches = [
+            list(range(i, min(i + batch_size, len(dataset))))
+            for i in range(0, len(dataset), batch_size)
+        ]
+        my_batches = all_batches[rank::world_size]
+        if world_size > len(all_batches) and is_main:
+            logger.warning(
+                "world_size=%d exceeds the %d batch(es) available; %d rank(s) will "
+                "sit idle. Lower batch_size or the rank count to use them.",
+                world_size, len(all_batches), world_size - len(all_batches),
+            )
+        if world_size > 1:
+            logger.info(
+                "Rank %d: %d of %d batches (%d rows)",
+                rank, len(my_batches), len(all_batches),
+                sum(len(b) for b in my_batches),
+            )
 
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(x_t, x_p, compute_masked_logits=False)
-            z_t_list.append(outputs["text_joint_latent"].detach().float().cpu())
-            z_p_list.append(outputs["seq_joint_latent"].detach().float().cpu())
-            # z_t_list.append(outputs[0])
-            # z_p_list.append(outputs[1])
-            text_list += texts
-            protein_list += sequences
-            acc_id_list += accessions
+        loader = DataLoader(
+            dataset,
+            batch_sampler=my_batches,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=partial(prep.collate_fn, dataset=dataset, include_raw=True),
+        )
 
-    # z_t = torch.cat(z_t_list).cpu()
-    # z_p = torch.cat(z_p_list).cpu()
+        # Run inference and store accession, text, protein sequence, z_t, and z_p
+        z_t_list = []
+        z_p_list = []
+        text_list = []
+        protein_list = []
+        acc_id_list = []
+
+        # Determine autocast dtype: use fp16 on CUDA, bf16 on XPU/CPU if available
+        use_amp = device.type in ("cuda", "xpu") and not args.no_amp
+        amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+        logger.info("autocast: %s", amp_dtype if use_amp else "disabled (fp32)")
+
+        index_list = [i for b in my_batches for i in b]
+
+        with torch.inference_mode():
+            for item in tqdm.tqdm(loader, disable=not is_main):
+                x_t, x_p, texts, sequences, accessions = item
+                x_t = x_t.to(device, non_blocking=True)
+                x_p = x_p.to(device, non_blocking=True)
+
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    outputs = model(x_t, x_p, compute_masked_logits=False)
+                z_t_list.append(outputs["text_joint_latent"].detach().float().cpu())
+                z_p_list.append(outputs["seq_joint_latent"].detach().float().cpu())
+                # z_t_list.append(outputs[0])
+                # z_p_list.append(outputs[1])
+                text_list += texts
+                protein_list += sequences
+                acc_id_list += accessions
+
+        # z_t = torch.cat(z_t_list).cpu()
+        # z_p = torch.cat(z_p_list).cpu()
     
-    # ORIGINAL CODE FROM HUGGING FACE SEEMS TO PREVENT PARALLELIZATION
-    # with torch.no_grad():
-    #     for idx in tqdm.trange(len(dataset)):
-    #         # print(f"{idx}/{len(dataset)}")
-    #         batch = dataset[idx]
-    #         x_t, x_p = batch
-    #         outputs = model(x_t, x_p, compute_masked_logits=False) # Infer Joint-Embeddings 
-    #         z_t = outputs['text_joint_latent']  # Text latent
-    #         z_p = outputs['seq_joint_latent']   # Protein latent
-    #         z_t_list.append(z_t)
-    #         z_p_list.append(z_p)
+        # ORIGINAL CODE FROM HUGGING FACE SEEMS TO PREVENT PARALLELIZATION
+        # with torch.no_grad():
+        #     for idx in tqdm.trange(len(dataset)):
+        #         # print(f"{idx}/{len(dataset)}")
+        #         batch = dataset[idx]
+        #         x_t, x_p = batch
+        #         outputs = model(x_t, x_p, compute_masked_logits=False) # Infer Joint-Embeddings 
+        #         z_t = outputs['text_joint_latent']  # Text latent
+        #         z_p = outputs['seq_joint_latent']   # Protein latent
+        #         z_t_list.append(z_t)
+        #         z_p_list.append(z_p)
             
-    #         protein_sequence = dataset.protein_sequence_list[idx]
-    #         text_prompt = dataset.text_captions_list[idx]
-    #         text_list.append(text_prompt)
-    #         protein_list.append(protein_sequence)
+        #         protein_sequence = dataset.protein_sequence_list[idx]
+        #         text_prompt = dataset.text_captions_list[idx]
+        #         text_list.append(text_prompt)
+        #         protein_list.append(protein_sequence)
 
-    # Stack this rank's latent vectors. A rank gets no batches at all when
-    # len(all_batches) < world_size, so guard the empty case.
-    z_t_tensor = torch.vstack(z_t_list) if z_t_list else torch.empty(0)
-    z_p_tensor = torch.vstack(z_p_list) if z_p_list else torch.empty(0)
+        # Stack this rank's latent vectors. A rank gets no batches at all when
+        # len(all_batches) < world_size, so guard the empty case.
+        # 2-D even when empty: the reporting below norms over dim=1, and a bare
+        # torch.empty(0) is 1-D.
+        z_t_tensor = torch.vstack(z_t_list) if z_t_list else torch.empty(0, 0)
+        z_p_tensor = torch.vstack(z_p_list) if z_p_list else torch.empty(0, 0)
 
-    # Distributed: every rank writes its shard, then rank 0 merges in global row
-    # order and the others are done. Shards go via disk rather than
-    # gather_object_to_main because that helper is built on all_gather_object,
-    # which would materialise the whole dataset on every rank.
-    if world_size > 1:
-        torch.save(
-            {
-                "indices": index_list,
-                "z_t": z_t_tensor,
-                "z_p": z_p_tensor,
-                "texts": text_list,
-                "sequences": protein_list,
-                "accessions": acc_id_list,
-            },
-            _shard_path(args.output_path, rank),
+        # Distributed: every rank writes its shard, then rank 0 merges in global row
+        # order and the others are done. Shards go via disk rather than
+        # gather_object_to_main because that helper is built on all_gather_object,
+        # which would materialise the whole dataset on every rank.
+        if world_size > 1:
+            torch.save(
+                {
+                    "indices": index_list,
+                    "z_t": z_t_tensor,
+                    "z_p": z_p_tensor,
+                    "texts": text_list,
+                    "sequences": protein_list,
+                    "accessions": acc_id_list,
+                },
+                _shard_path(args.output_path, rank),
+            )
+            barrier()
+            if not is_main:
+                return
+            z_t_tensor, z_p_tensor, text_list, protein_list, acc_id_list = (
+                _merge_rank_shards(args.output_path, world_size)
+            )
+
+        text_prompt_array = np.array(
+            [s.encode("utf-8") for s in text_list], dtype=object
         )
-        barrier()
-        if not is_main:
-            return
-        z_t_tensor, z_p_tensor, text_list, protein_list, acc_id_list = (
-            _merge_rank_shards(args.output_path, world_size)
+        protein_array = np.array(
+            [s.encode("utf-8") for s in protein_list], dtype=object
         )
-
-    text_prompt_array = np.array(
-        [s.encode("utf-8") for s in text_list], dtype=object
-    )
-    protein_array = np.array(
-        [s.encode("utf-8") for s in protein_list], dtype=object
-    )
-    acc_id_array = np.array(
-        [s.encode("utf-8") for s in acc_id_list], dtype=object
-    )
+        acc_id_array = np.array(
+            [s.encode("utf-8") for s in acc_id_list], dtype=object
+        )
     
-    # Prepare embedding dict.
-    embedding_dict = {
-            'z_t': z_t_tensor,
-            'z_p': z_p_tensor,
-            'text_prompts': text_prompt_array,
-            'sequence': protein_array,
-            'acc_id': acc_id_array,
-    }
+        # Prepare embedding dict.
+        embedding_dict = {
+                'z_t': z_t_tensor,
+                'z_p': z_p_tensor,
+                'text_prompts': text_prompt_array,
+                'sequence': protein_array,
+                'acc_id': acc_id_array,
+        }
     
-    # Compute magnitudes (L2 norms) for z_t and z_p
-    z_p_magnitude = torch.norm(z_p_tensor, dim=1)  # L2 norm for each protein latent vector
-    z_t_magnitude = torch.norm(z_t_tensor, dim=1)  # L2 norm for each text latent vector
+        # Compute magnitudes (L2 norms) for z_t and z_p
+        z_p_magnitude = torch.norm(z_p_tensor, dim=1)  # L2 norm for each protein latent vector
+        z_t_magnitude = torch.norm(z_t_tensor, dim=1)  # L2 norm for each text latent vector
 
-    # Print results
-    logger.info("\n=== Inference Results ===")
-    logger.info("Shape of z_p (protein latent): %s", z_p_tensor.shape)
-    logger.info("Shape of z_t (text latent): %s", z_t_tensor.shape)
-    logger.info("Magnitudes of z_p vectors: %s", z_p_magnitude)
-    logger.info("Magnitudes of z_t vectors: %s", z_t_magnitude)
+        # Print results
+        logger.info("\n=== Inference Results ===")
+        logger.info("Shape of z_p (protein latent): %s", z_p_tensor.shape)
+        logger.info("Shape of z_t (text latent): %s", z_t_tensor.shape)
+        logger.info("Magnitudes of z_p vectors: %s", z_p_magnitude)
+        logger.info("Magnitudes of z_t vectors: %s", z_t_magnitude)
 
-    # O(n^2) cross-comparison metrics (print-only; the saved embeddings above are
-    # unaffected). Skipped unless explicitly requested: each metric allocates an
-    # n x n fp32 matrix, which is ~25 GB at n=80k.
-    cc_limit = args.cross_comparison_sample_limit or 0
-    if cc_limit == 0:
-        logger.info(
-            "\n=== Cross-comparison metrics skipped "
-            "(--cross_comparison_sample_limit 0) ==="
-        )
-    else:
-        n_cc = (
-            len(z_p_tensor) if cc_limit < 0
-            else min(cc_limit, len(z_p_tensor))
-        )
-        z_p_cc = z_p_tensor[:n_cc]
-        z_t_cc = z_t_tensor[:n_cc]
+        # O(n^2) cross-comparison metrics (print-only; the saved embeddings above are
+        # unaffected). Skipped unless explicitly requested: each metric allocates an
+        # n x n fp32 matrix, which is ~25 GB at n=80k.
+        cc_limit = args.cross_comparison_sample_limit or 0
+        if cc_limit == 0:
+            logger.info(
+                "\n=== Cross-comparison metrics skipped "
+                "(--cross_comparison_sample_limit 0) ==="
+            )
+        else:
+            n_cc = (
+                len(z_p_tensor) if cc_limit < 0
+                else min(cc_limit, len(z_p_tensor))
+            )
+            z_p_cc = z_p_tensor[:n_cc]
+            z_t_cc = z_t_tensor[:n_cc]
 
-        # Compute Dot Product scores
-        dot_product_scores = torch.matmul(z_p_cc, z_t_cc.T)  # Dot product
+            # Compute Dot Product scores
+            dot_product_scores = torch.matmul(z_p_cc, z_t_cc.T)  # Dot product
 
-        # Normalize scores into probabilities
-        protein_given_text_probs = F.softmax(dot_product_scores, dim=0)  # Normalize across rows (proteins), for each text
-        text_given_protein_probs = F.softmax(dot_product_scores, dim=1)  # Normalize across columns (texts), for each protein
+            # Normalize scores into probabilities
+            protein_given_text_probs = F.softmax(dot_product_scores, dim=0)  # Normalize across rows (proteins), for each text
+            text_given_protein_probs = F.softmax(dot_product_scores, dim=1)  # Normalize across columns (texts), for each protein
 
-        # Compute homology probabilities
-        homology_matrix = compute_homology_matrix(z_p_cc)
+            # Compute homology probabilities
+            homology_matrix = compute_homology_matrix(z_p_cc)
 
-        logger.info(
-            "\n=== Cross-comparison subset: k=%d of %d samples ===",
-            n_cc, len(z_p_tensor),
-        )
+            logger.info(
+                "\n=== Cross-comparison subset: k=%d of %d samples ===",
+                n_cc, len(z_p_tensor),
+            )
 
-        logger.info("\n=== Dot Product Scores Matrix ===")
-        logger.info("%s", dot_product_scores)
+            logger.info("\n=== Dot Product Scores Matrix ===")
+            logger.info("%s", dot_product_scores)
 
-        logger.info("\n=== Normalized Probabilities ===")
-        logger.info("Protein-Normalized Probabilities (Softmax across Proteins for each Text):")
-        logger.info("%s", protein_given_text_probs)
+            logger.info("\n=== Normalized Probabilities ===")
+            logger.info("Protein-Normalized Probabilities (Softmax across Proteins for each Text):")
+            logger.info("%s", protein_given_text_probs)
 
-        logger.info("Text-Normalized Probabilities (Softmax across Texts for each Protein):")
-        logger.info("%s", text_given_protein_probs)
+            logger.info("Text-Normalized Probabilities (Softmax across Texts for each Protein):")
+            logger.info("%s", text_given_protein_probs)
 
-        logger.info("\n=== Homology Matrix (Dot Product of Normalized z_p) ===")
-        logger.info("%s", homology_matrix)
+            logger.info("\n=== Homology Matrix (Dot Product of Normalized z_p) ===")
+            logger.info("%s", homology_matrix)
 
-    logger.info("\n=== Example raw data elements ===")
-    for k in range(min(len(acc_id_array), 3)):
-        logger.info("  acc_id[%s]: %s", k, acc_id_array[k])
-        logger.info("sequence[%s]: %s", k, protein_array[k])
+        logger.info("\n=== Example raw data elements ===")
+        for k in range(min(len(acc_id_array), 3)):
+            logger.info("  acc_id[%s]: %s", k, acc_id_array[k])
+            logger.info("sequence[%s]: %s", k, protein_array[k])
     
-    # Save output
-    torch.save(embedding_dict, config_args_parser.output_path)
+        # Save output
+        torch.save(embedding_dict, config_args_parser.output_path)
 
-    # Write manifest and clean up logging
-    elapsed = datetime.now() - start_time
-    input_display = (
-        os.path.abspath(args.input_data_path)
-        if args.input_data_path.lower() != "none"
-        else "None (test dataset)"
-    )
-    if _setup_logging:
-        write_manifest(
-            args, outdir, start_time, elapsed,
-            outputs={
-                "num_samples": len(acc_id_array),
-                "embedding_dim": int(z_t_tensor.shape[1]),
-                "output_file": os.path.abspath(args.output_path),
-            },
-            resolved_paths={
-                "input_data_path": input_display,
-                "model_path": os.path.abspath(args.model_path),
-                "json_config": os.path.abspath(args.config_path),
-            },
-            config_contents=raw_config,
+        # Write manifest
+        elapsed = datetime.now() - start_time
+        input_display = (
+            os.path.abspath(args.input_data_path)
+            if args.input_data_path.lower() != "none"
+            else "None (test dataset)"
         )
-        logger.info("Done in %s", elapsed)
+        if _setup_logging:
+            write_manifest(
+                args, outdir, start_time, elapsed,
+                outputs={
+                    "num_samples": len(acc_id_array),
+                    "embedding_dim": int(z_t_tensor.shape[1]),
+                    "output_file": os.path.abspath(args.output_path),
+                },
+                resolved_paths={
+                    "input_data_path": input_display,
+                    "model_path": os.path.abspath(args.model_path),
+                    "json_config": os.path.abspath(args.config_path),
+                },
+                config_contents=raw_config,
+            )
+            logger.info("Done in %s", elapsed)
+    finally:
         teardown_file_logging("biom3", file_handler)
 
 

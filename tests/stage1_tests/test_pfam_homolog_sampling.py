@@ -48,9 +48,10 @@ def test_draws_stay_in_the_requested_family():
     ds = _dataset()
     random.seed(1)
     for _ in range(100):
-        accession, _, _, flag = ds.extraction_pfam_samples(["PF00002"])
+        accession, _, _, flag, label = ds.extraction_pfam_samples(["PF00002"])
         assert accession.startswith("F2_"), accession
         assert flag == ["True"]
+        assert label == "PF00002"
 
 
 def test_draws_are_reproducible_from_the_run_seed():

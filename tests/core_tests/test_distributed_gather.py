@@ -7,6 +7,7 @@ real: NCCL has no ``gather`` at all, so the helper must stay on ``all_gather``.
 
 import os
 
+import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -53,6 +54,6 @@ def test_gather_handles_empty_shards():
     assert len(results[0]) == 4
 
 
+@pytest.mark.usefixtures("no_process_group")
 def test_gather_is_noop_without_launcher():
-    assert not dist.is_initialized()
     assert gather_object_to_main({"a": 1}) == [{"a": 1}]

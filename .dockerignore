@@ -1,0 +1,44 @@
+# Shared by every docker/Dockerfile.* — each builds with the repo ROOT as its
+# context, so patterns below are relative to it. Do not add a per-Dockerfile
+# docker/Dockerfile.<variant>.dockerignore: BuildKit uses that file INSTEAD of
+# this one, so every exclusion here would silently stop applying to that image.
+#
+# The Dockerfiles use explicit COPYs (never `COPY . .`), so most entries here
+# only keep the context sent to the daemon small/fast — especially the multi-GB
+# weights/ and data/. The first group is different: those files sit INSIDE a
+# copied dir, so this file is the only thing keeping them out of the image.
+
+# Gitignored machine-local settings (e.g. the real bucket URI). The published
+# images are public, so these must never be baked in.
+configs/jobs/local.env
+**/.env
+**/.envrc
+
+# Large / runtime-populated dirs (gitignored) — mounted or synced at run time.
+weights/
+data/
+outputs/
+logs/
+
+# Not needed in the image.
+jobs/
+demos/
+docs/
+venvs/
+
+# VCS / tooling / caches.
+.git/
+.github/
+.claude/
+.pytest_cache/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Test scratch (tests/ itself IS copied for `pytest --quick`).
+tests/_tmp/
+
+# Editor / OS cruft.
+.DS_Store
+.vscode/
+.idea/

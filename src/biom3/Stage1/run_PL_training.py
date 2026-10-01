@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 
 from biom3.backend.device import BACKEND_NAME, _XPU, setup_logger, set_float32_matmul_precision
+from biom3.backend.device import DEVICE_CHOICES, resolve_device, check_devices_per_node
 
 if BACKEND_NAME == _XPU:
     import lightning as pl
@@ -217,9 +218,10 @@ def get_args(parser):
                         help="fp32 matmul precision. 'medium' (default) uses the bf16 "
                              "path; 'high' uses TF32 tensor cores; 'highest' keeps full "
                              "fp32. CLI overrides the config value.")
-    parser.add_argument('--device', type=str, default='cuda',
-                        choices=['cuda', 'xpu', 'cpu'],
-                        help='Compute device for training.')
+    parser.add_argument('--device', type=str, default='auto',
+                        choices=list(DEVICE_CHOICES),
+                        help='Compute device for training; auto = the detected '
+                             'GPU backend (CUDA, then XPU; never falls back to CPU).')
     parser.add_argument('--devices_per_node', type=int, default=None,
                         help='Number of GPUs (CUDA) or tiles (XPU) per node. Default 1.')
     parser.add_argument('--gpu_devices', type=int, default=None,
@@ -333,6 +335,35 @@ def get_model_args(parser):
                         help='Dropout rate inside the projection heads.')
     parser.add_argument('--temperature', type=float, default=0.8,
                         help='Softmax temperature for the contrastive loss.')
+    parser.add_argument('--mask_same_sequence', type=str, default='False',
+                        help="'True'/'False'. Exclude candidates whose protein "
+                             'sequence is identical to the anchor\'s from the '
+                             'contrastive denominator. Swiss-Prot carries ~8.9 '
+                             'caption variants per accession, so ~5.6% of rows '
+                             'have such a false negative in the pooled batch.')
+    parser.add_argument('--mask_same_family', type=str, default='False',
+                        help="'True'/'False'. Exclude candidates drawn on the "
+                             'same Pfam family as the anchor. At M = 49,152 a '
+                             'row has ~25 of these against the single (i, i+-N) '
+                             'pair the homolog index rule already covers; for '
+                             'L_PFC they are the very items it exists to pull '
+                             'together. Defaults off so Run 1 is reproducible.')
+    parser.add_argument('--uniformity_weight', type=float, default=0.0,
+                        help='Weight of the Wang & Isola (2020) uniformity term '
+                             'on the L2-normalized joint embeddings (pfam dataset '
+                             'types only). 0 disables it.')
+    parser.add_argument('--uniformity_t', type=float, default=2.0,
+                        help='Gaussian-potential scale t in the uniformity term. '
+                             'Its minimum in high dimension is about -2t.')
+    parser.add_argument('--log_uniformity', type=str, default='False',
+                        help="'True'/'False'. Compute and log the uniformity term "
+                             'without adding it to the loss, so a weight-0 control '
+                             'run reports the same metric as a weighted one. '
+                             'Implied when --uniformity_weight > 0.')
+    parser.add_argument('--uniformity_on', type=str, default='both',
+                        choices=['protein', 'text', 'both'],
+                        help='Which joint embeddings the uniformity term spreads: '
+                             'z_p, z_t, or the mean of both.')
 
     parser.add_argument('--sequence_keyword', type=str, default='protein_sequence',
                         help='CSV column name for the protein sequence.')
@@ -402,6 +433,9 @@ def retrieve_all_args(args):
     args.scale_learning_rate = parse_lr_scaling(args.scale_learning_rate)
     args.wandb = str_to_bool(args.wandb)
     args.save_metrics_history = str_to_bool(args.save_metrics_history)
+    args.log_uniformity = str_to_bool(args.log_uniformity)
+    args.mask_same_sequence = str_to_bool(args.mask_same_sequence)
+    args.mask_same_family = str_to_bool(args.mask_same_family)
     args.metrics_history_all_ranks_val_loss = str_to_bool(
         args.metrics_history_all_ranks_val_loss
     )
@@ -424,6 +458,10 @@ def retrieve_all_args(args):
     if args.dataset_type in ('pfam', 'pfam_ablated') and args.model_type == 'default':
         logger.info("Auto-setting model_type='pfam' for dataset_type=%s", args.dataset_type)
         args.model_type = 'pfam'
+    if args.uniformity_weight > 0 and args.dataset_type not in ('pfam', 'pfam_ablated'):
+        raise ValueError(
+            f"--uniformity_weight is only applied for dataset_type pfam/pfam_ablated, "
+            f"got dataset_type={args.dataset_type}")
 
     # Construct a default run_id if missing
     if args.run_id is None:
@@ -741,6 +779,13 @@ def main(args):
     warnings.filterwarnings("ignore", message=".*TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD.*")
     logging.getLogger("tensorboardX.x2num").setLevel(logging.ERROR)
 
+    # A dry run only probes config, data and model, so it may land on CPU; a
+    # real run must find a GPU unless --device cpu was asked for explicitly.
+    dry_run = getattr(args, 'dry_run', False)
+    args.device = resolve_device(args.device, allow_cpu=dry_run)
+    if not dry_run:
+        check_devices_per_node(args.device, args.devices_per_node)
+
     if getattr(args, 'dry_run', False):
         return run_dry_run(
             args,
@@ -757,81 +802,81 @@ def main(args):
         os.makedirs(logs_dir, exist_ok=True)
         os.makedirs(artifacts_dir, exist_ok=True)
     log_path, file_handler = setup_file_logging(artifacts_dir)
+    try:
+        set_float32_matmul_precision(args.float32_matmul_precision)
+        clear_gpu_cache()
 
-    set_float32_matmul_precision(args.float32_matmul_precision)
-    clear_gpu_cache()
+        seed = args.seed
+        if seed <= 0:
+            seed = np.random.randint(2 ** 32)
+            args.seed = seed
+        set_seed(seed)
+        logger.info("Using seed: %s", seed)
 
-    seed = args.seed
-    if seed <= 0:
-        seed = np.random.randint(2 ** 32)
-        args.seed = seed
-    set_seed(seed)
-    logger.info("Using seed: %s", seed)
+        data_module, PL_model = get_dataloaders_models(args=args)
+        logger.info("PenCL parameters: %s", sum(p.numel() for p in PL_model.model.parameters()))
 
-    data_module, PL_model = get_dataloaders_models(args=args)
-    logger.info("PenCL parameters: %s", sum(p.numel() for p in PL_model.model.parameters()))
+        if args.pretrained_weights is not None and os.path.exists(args.pretrained_weights):
+            PL_model = load_pretrained_weights(PL_model, args.pretrained_weights)
+        elif args.pretrained_weights is not None:
+            logger.warning("Pretrained weights path does not exist: %s", args.pretrained_weights)
 
-    if args.pretrained_weights is not None and os.path.exists(args.pretrained_weights):
-        PL_model = load_pretrained_weights(PL_model, args.pretrained_weights)
-    elif args.pretrained_weights is not None:
-        logger.warning("Pretrained weights path does not exist: %s", args.pretrained_weights)
+        train_model(args=args, PL_model=PL_model, data_module=data_module)
 
-    train_model(args=args, PL_model=PL_model, data_module=data_module)
+        if get_global_rank() == 0:
+            elapsed = datetime.now() - start_time
 
-    if get_global_rank() == 0:
-        elapsed = datetime.now() - start_time
+            args_path = os.path.join(artifacts_dir, "args.json")
+            backup_if_exists(args_path)
+            with open(args_path, "w") as f:
+                json.dump({k: v for k, v in vars(args).items() if not k.startswith("_")},
+                          f, indent=2, default=str)
+            logger.info("Args written to %s", args_path)
 
-        args_path = os.path.join(artifacts_dir, "args.json")
-        backup_if_exists(args_path)
-        with open(args_path, "w") as f:
-            json.dump({k: v for k, v in vars(args).items() if not k.startswith("_")},
-                      f, indent=2, default=str)
-        logger.info("Args written to %s", args_path)
+            total_params = sum(p.numel() for p in PL_model.model.parameters())
+            trainable_params = sum(
+                p.numel() for p in PL_model.model.parameters() if p.requires_grad
+            )
 
-        total_params = sum(p.numel() for p in PL_model.model.parameters())
-        trainable_params = sum(
-            p.numel() for p in PL_model.model.parameters() if p.requires_grad
-        )
+            outputs = {
+                "seed": args.seed,
+                "total_params": total_params,
+                "trainable_params": trainable_params,
+                "batch_size": args.batch_size,
+                "head_lr": args.head_lr,
+                "protein_encoder_lr": args.protein_encoder_lr,
+                "text_encoder_lr": args.text_encoder_lr,
+                "precision": args.precision,
+                "devices_per_node": args.devices_per_node,
+                "num_nodes": args.num_nodes,
+                "acc_grad_batches": args.acc_grad_batches,
+                "epochs": args.epochs,
+                "dataset_type": args.dataset_type,
+                "model_type": args.model_type,
+            }
 
-        outputs = {
-            "seed": args.seed,
-            "total_params": total_params,
-            "trainable_params": trainable_params,
-            "batch_size": args.batch_size,
-            "head_lr": args.head_lr,
-            "protein_encoder_lr": args.protein_encoder_lr,
-            "text_encoder_lr": args.text_encoder_lr,
-            "precision": args.precision,
-            "devices_per_node": args.devices_per_node,
-            "num_nodes": args.num_nodes,
-            "acc_grad_batches": args.acc_grad_batches,
-            "epochs": args.epochs,
-            "dataset_type": args.dataset_type,
-            "model_type": args.model_type,
-        }
+            resolved_paths = {
+                "checkpoint_dir": os.path.abspath(checkpoint_dir),
+                "artifacts_dir": os.path.abspath(artifacts_dir),
+            }
+            if args.data_path is not None:
+                resolved_paths["data_path"] = os.path.abspath(args.data_path)
+            if args.pfam_data_path is not None:
+                resolved_paths["pfam_data_path"] = os.path.abspath(args.pfam_data_path)
+            if args.pretrained_weights is not None:
+                resolved_paths["pretrained_weights"] = os.path.abspath(args.pretrained_weights)
+            if args.resume_from_checkpoint is not None:
+                resolved_paths["resume_from_checkpoint"] = os.path.abspath(args.resume_from_checkpoint)
 
-        resolved_paths = {
-            "checkpoint_dir": os.path.abspath(checkpoint_dir),
-            "artifacts_dir": os.path.abspath(artifacts_dir),
-        }
-        if args.data_path is not None:
-            resolved_paths["data_path"] = os.path.abspath(args.data_path)
-        if args.pfam_data_path is not None:
-            resolved_paths["pfam_data_path"] = os.path.abspath(args.pfam_data_path)
-        if args.pretrained_weights is not None:
-            resolved_paths["pretrained_weights"] = os.path.abspath(args.pretrained_weights)
-        if args.resume_from_checkpoint is not None:
-            resolved_paths["resume_from_checkpoint"] = os.path.abspath(args.resume_from_checkpoint)
-
-        manifest_path = write_manifest(
-            args, artifacts_dir, start_time, elapsed,
-            outputs=outputs,
-            resolved_paths=resolved_paths,
-            environment=collect_training_env(),
-        )
-        logger.info("Build manifest written to %s", manifest_path)
-
-    teardown_file_logging("biom3", file_handler)
+            manifest_path = write_manifest(
+                args, artifacts_dir, start_time, elapsed,
+                outputs=outputs,
+                resolved_paths=resolved_paths,
+                environment=collect_training_env(),
+            )
+            logger.info("Build manifest written to %s", manifest_path)
+    finally:
+        teardown_file_logging("biom3", file_handler)
 
 
 _DRY_RUN_CACHE = {}

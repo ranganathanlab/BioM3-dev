@@ -25,6 +25,9 @@ Two padding regimes are checked:
   longest    -- padding varies with the batch. This is the regime that actually
                 probes whether the mask is doing its job.
 """
+import os
+
+import pytest
 import torch
 from transformers import AutoTokenizer
 
@@ -35,8 +38,9 @@ SAME_BATCH_SIZE = "C1 in [C1,C2] vs [C1,C3]"    # the stated requirement
 ALONE = "C1 in [C1,C2] vs alone"                # batch size 2 vs 1
 LARGER_BATCH = "C1 in [C1,C2,C3] vs [C1,C2]"    # batch size 3 vs 2
 
-TEXT_MODEL = ("/flare/NLDesignProtein/ahowe/BioM3-dev-space/BioM3-dev/weights/LLMs/"
-              "BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext")
+TEXT_MODEL = "weights/LLMs/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext"
+pytestmark = pytest.mark.skipif(not os.path.exists(TEXT_MODEL),
+                                reason=f"Weight files not found: {TEXT_MODEL}")
 
 # Three captions of deliberately different tokenized lengths.
 C1 = "PROTEIN NAME: Serine protease."
@@ -66,7 +70,7 @@ def _build():
 
 def _z_t(tok, enc, proj, captions, args, padding, use_mask=True):
     """Reproduce the training z_t path for a batch of captions."""
-    batch = tok.batch_encode_plus(
+    batch = tok(
         captions,
         truncation=True,
         max_length=args.text_max_length,

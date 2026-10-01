@@ -326,251 +326,250 @@ def main(args):
     log_path, file_handler = setup_file_logging(
         args.outdir, logger_prefix="biom3.dbio", log_filename="build.log",
     )
+    try:
+        start_time = datetime.now()
+        logger.info("=" * 60)
+        logger.info("Build fine-tuning dataset")
+        logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
+        logger.info("Command:     %s", " ".join(sys.argv))
+        logger.info("Pfam IDs:    %s", " ".join(args.pfam_ids))
+        logger.info("Output dir:  %s", os.path.abspath(args.outdir))
+        logger.info("=" * 60)
 
-    start_time = datetime.now()
-    logger.info("=" * 60)
-    logger.info("Build fine-tuning dataset")
-    logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
-    logger.info("Command:     %s", " ".join(sys.argv))
-    logger.info("Pfam IDs:    %s", " ".join(args.pfam_ids))
-    logger.info("Output dir:  %s", os.path.abspath(args.outdir))
-    logger.info("=" * 60)
+        # Resolve paths
+        swissprot_path = _resolve_swissprot_path(args)
+        pfam_paths = _resolve_pfam_paths(args)
 
-    # Resolve paths
-    swissprot_path = _resolve_swissprot_path(args)
-    pfam_paths = _resolve_pfam_paths(args)
+        # Extract from SwissProt
+        logger.info("Extracting from SwissProt...")
+        sp_reader = SwissProtReader(swissprot_path)
+        df_sp = sp_reader.query_by_pfam(args.pfam_ids)
 
-    # Extract from SwissProt
-    logger.info("Extracting from SwissProt...")
-    sp_reader = SwissProtReader(swissprot_path)
-    df_sp = sp_reader.query_by_pfam(args.pfam_ids)
+        # Extract from Pfam input(s). For multi-path runs, query each in
+        # turn and concatenate. Dedupe on (primary_Accession, pfam_label)
+        # by default; --no_dedupe_pfam preserves the union as a multiset.
+        logger.info("Extracting from Pfam (%d input(s))...", len(pfam_paths))
+        per_path_dfs = []
+        for i, path in enumerate(pfam_paths, 1):
+            reader = PfamReader(path, chunk_size=args.chunk_size)
+            df_i = reader.query_by_pfam(
+                args.pfam_ids, keep_family_cols=True,
+            )
+            logger.info(
+                "Pfam input %d/%d (%s): %s rows",
+                i, len(pfam_paths), os.path.basename(path), f"{len(df_i):,}",
+            )
+            per_path_dfs.append(df_i)
 
-    # Extract from Pfam input(s). For multi-path runs, query each in
-    # turn and concatenate. Dedupe on (primary_Accession, pfam_label)
-    # by default; --no_dedupe_pfam preserves the union as a multiset.
-    logger.info("Extracting from Pfam (%d input(s))...", len(pfam_paths))
-    per_path_dfs = []
-    for i, path in enumerate(pfam_paths, 1):
-        reader = PfamReader(path, chunk_size=args.chunk_size)
-        df_i = reader.query_by_pfam(
-            args.pfam_ids, keep_family_cols=True,
-        )
-        logger.info(
-            "Pfam input %d/%d (%s): %s rows",
-            i, len(pfam_paths), os.path.basename(path), f"{len(df_i):,}",
-        )
-        per_path_dfs.append(df_i)
+        if per_path_dfs:
+            df_pfam = pd.concat(per_path_dfs, ignore_index=True)
+        else:
+            from biom3.dbio.readers.pfam_csv import OUTPUT_COLS as _PFAM_COLS
+            df_pfam = pd.DataFrame(
+                columns=_PFAM_COLS + ["family_name", "family_description"],
+            )
 
-    if per_path_dfs:
-        df_pfam = pd.concat(per_path_dfs, ignore_index=True)
-    else:
-        from biom3.dbio.readers.pfam_csv import OUTPUT_COLS as _PFAM_COLS
-        df_pfam = pd.DataFrame(
-            columns=_PFAM_COLS + ["family_name", "family_description"],
-        )
+        if not args.no_dedupe_pfam and len(pfam_paths) > 1:
+            pre = len(df_pfam)
+            df_pfam = df_pfam.drop_duplicates(
+                subset=["primary_Accession", "pfam_label"], keep="first",
+            ).reset_index(drop=True)
+            logger.info(
+                "Pfam (combined, deduped): %s → %s rows from %d input(s)",
+                f"{pre:,}", f"{len(df_pfam):,}", len(pfam_paths),
+            )
+        else:
+            logger.info(
+                "Pfam (combined): %s rows from %d input(s)",
+                f"{len(df_pfam):,}", len(pfam_paths),
+            )
 
-    if not args.no_dedupe_pfam and len(pfam_paths) > 1:
-        pre = len(df_pfam)
-        df_pfam = df_pfam.drop_duplicates(
-            subset=["primary_Accession", "pfam_label"], keep="first",
-        ).reset_index(drop=True)
-        logger.info(
-            "Pfam (combined, deduped): %s → %s rows from %d input(s)",
-            f"{pre:,}", f"{len(df_pfam):,}", len(pfam_paths),
-        )
-    else:
-        logger.info(
-            "Pfam (combined): %s rows from %d input(s)",
-            f"{len(df_pfam):,}", len(pfam_paths),
-        )
+        # Step 1: Populate annotation columns on Pfam rows
+        from biom3.dbio.enrich import enrich_dataframe
 
-    # Step 1: Populate annotation columns on Pfam rows
-    from biom3.dbio.enrich import enrich_dataframe
+        local_annotations = None
+        taxonomy_tree = None
+        accession_taxid_map = None
 
-    local_annotations = None
-    taxonomy_tree = None
-    accession_taxid_map = None
+        if args.enrich_pfam or args.add_taxonomy:
+            accessions = df_pfam["primary_Accession"].dropna().unique().tolist()
+            accession_set = set(accessions)
 
-    if args.enrich_pfam or args.add_taxonomy:
-        accessions = df_pfam["primary_Accession"].dropna().unique().tolist()
-        accession_set = set(accessions)
+            if args.enrich_pfam:
+                if not args.annotation_cache and not args.uniprot_dat:
+                    raise ValueError(
+                        "--enrich_pfam requires --annotation_cache or "
+                        "--uniprot_dat. The legacy UniProt REST API path was "
+                        "removed in v0.1.0a7; build a TrEMBL annotation cache "
+                        "via biom3_build_annotation_cache instead."
+                    )
 
-        if args.enrich_pfam:
-            if not args.annotation_cache and not args.uniprot_dat:
-                raise ValueError(
-                    "--enrich_pfam requires --annotation_cache or "
-                    "--uniprot_dat. The legacy UniProt REST API path was "
-                    "removed in v0.1.0a7; build a TrEMBL annotation cache "
-                    "via biom3_build_annotation_cache instead."
-                )
+                local_annotations = {}
 
-            local_annotations = {}
+                # Priority 1: Parquet annotation cache (instant lookup)
+                if args.annotation_cache:
+                    from biom3.dbio.helpers.annotation_cache import load_annotation_cache
 
-            # Priority 1: Parquet annotation cache (instant lookup)
-            if args.annotation_cache:
-                from biom3.dbio.helpers.annotation_cache import load_annotation_cache
-
-                local_annotations = load_annotation_cache(
-                    args.annotation_cache, accession_set,
-                )
-                logger.info("Annotation cache: %s/%s accessions found",
-                            f"{len(local_annotations):,}",
-                            f"{len(accessions):,}")
-
-            # Priority 2: Raw .dat file parsing (remaining accessions)
-            if args.uniprot_dat:
-                remaining = accession_set - set(local_annotations.keys())
-                if remaining:
-                    from biom3.dbio.parsers.swissprot_dat import SwissProtDatParser
-
-                    for dat_path in args.uniprot_dat:
-                        logger.info("Parsing local .dat file: %s", dat_path)
-                        parser = SwissProtDatParser(dat_path)
-                        still_remaining = accession_set - set(local_annotations.keys())
-                        if not still_remaining:
-                            logger.info("All accessions already found, skipping %s", dat_path)
-                            break
-                        local_annotations.update(parser.parse(still_remaining))
-                    logger.info("Local enrichment total: %s/%s accessions found",
+                    local_annotations = load_annotation_cache(
+                        args.annotation_cache, accession_set,
+                    )
+                    logger.info("Annotation cache: %s/%s accessions found",
                                 f"{len(local_annotations):,}",
                                 f"{len(accessions):,}")
 
-            local_annotations = local_annotations or None
+                # Priority 2: Raw .dat file parsing (remaining accessions)
+                if args.uniprot_dat:
+                    remaining = accession_set - set(local_annotations.keys())
+                    if remaining:
+                        from biom3.dbio.parsers.swissprot_dat import SwissProtDatParser
 
-        if args.add_taxonomy:
-            taxonomy_tree, accession_taxid_map = _load_taxonomy(
-                args, accessions,
-            )
+                        for dat_path in args.uniprot_dat:
+                            logger.info("Parsing local .dat file: %s", dat_path)
+                            parser = SwissProtDatParser(dat_path)
+                            still_remaining = accession_set - set(local_annotations.keys())
+                            if not still_remaining:
+                                logger.info("All accessions already found, skipping %s", dat_path)
+                                break
+                            local_annotations.update(parser.parse(still_remaining))
+                        logger.info("Local enrichment total: %s/%s accessions found",
+                                    f"{len(local_annotations):,}",
+                                    f"{len(accessions):,}")
 
-    # Load source-CSV lookups for the join layer (opt-in). CSV paths fall
-    # back to config defaults (configs/dbio_config.json training_datasets).
-    expasy_lookup = None
-    brenda_lookup = None
-    smart_lookup = None
+                local_annotations = local_annotations or None
 
-    if args.use_expasy:
-        expasy_path = _resolve_source_csv(args, "expasy_csv", "expasy_csv")
-        if not expasy_path:
-            raise ValueError(
-                "--use_expasy requires --expasy_csv or an expasy_csv entry "
-                "in the dbio config (and the file must exist on disk)."
-            )
-        args.expasy_csv = expasy_path
-        from biom3.dbio.enrich import load_expasy_lookup
-        expasy_lookup = load_expasy_lookup(expasy_path)
-    if args.use_brenda:
-        brenda_path = _resolve_source_csv(args, "brenda_csv", "brenda_csv")
-        if not brenda_path:
-            raise ValueError(
-                "--use_brenda requires --brenda_csv or a brenda_csv entry "
-                "in the dbio config (and the file must exist on disk)."
-            )
-        args.brenda_csv = brenda_path
-        from biom3.dbio.enrich import load_brenda_lookup
-        brenda_lookup = load_brenda_lookup(brenda_path)
-    if args.use_smart:
-        smart_path = _resolve_source_csv(args, "smart_csv", "smart_csv")
-        if not smart_path:
-            raise ValueError(
-                "--use_smart requires --smart_csv or a smart_csv entry "
-                "in the dbio config (and the file must exist on disk)."
-            )
-        args.smart_csv = smart_path
-        from biom3.dbio.enrich import load_smart_lookup
-        smart_lookup = load_smart_lookup(smart_path)
+            if args.add_taxonomy:
+                taxonomy_tree, accession_taxid_map = _load_taxonomy(
+                    args, accessions,
+                )
 
-    # Always run enrich_dataframe to copy family columns into annot_* columns
-    df_pfam, join_stats = enrich_dataframe(
-        df_pfam,
-        local_annotations=local_annotations,
-        taxonomy_tree=taxonomy_tree,
-        accession_taxid_map=accession_taxid_map,
-        expasy_lookup=expasy_lookup,
-        brenda_lookup=brenda_lookup,
-        smart_lookup=smart_lookup,
-        organism_match=args.organism_match,
-    )
+        # Load source-CSV lookups for the join layer (opt-in). CSV paths fall
+        # back to config defaults (configs/dbio_config.json training_datasets).
+        expasy_lookup = None
+        brenda_lookup = None
+        smart_lookup = None
 
-    # Step 2: Compose [final]text_caption from annotation columns (Pfam only).
-    # SwissProt rows already have ALL-CAPS captions from the source CSV.
-    df_pfam = compose_caption(df_pfam)
+        if args.use_expasy:
+            expasy_path = _resolve_source_csv(args, "expasy_csv", "expasy_csv")
+            if not expasy_path:
+                raise ValueError(
+                    "--use_expasy requires --expasy_csv or an expasy_csv entry "
+                    "in the dbio config (and the file must exist on disk)."
+                )
+            args.expasy_csv = expasy_path
+            from biom3.dbio.enrich import load_expasy_lookup
+            expasy_lookup = load_expasy_lookup(expasy_path)
+        if args.use_brenda:
+            brenda_path = _resolve_source_csv(args, "brenda_csv", "brenda_csv")
+            if not brenda_path:
+                raise ValueError(
+                    "--use_brenda requires --brenda_csv or a brenda_csv entry "
+                    "in the dbio config (and the file must exist on disk)."
+                )
+            args.brenda_csv = brenda_path
+            from biom3.dbio.enrich import load_brenda_lookup
+            brenda_lookup = load_brenda_lookup(brenda_path)
+        if args.use_smart:
+            smart_path = _resolve_source_csv(args, "smart_csv", "smart_csv")
+            if not smart_path:
+                raise ValueError(
+                    "--use_smart requires --smart_csv or a smart_csv entry "
+                    "in the dbio config (and the file must exist on disk)."
+                )
+            args.smart_csv = smart_path
+            from biom3.dbio.enrich import load_smart_lookup
+            smart_lookup = load_smart_lookup(smart_path)
 
-    # Track provenance so stats can report per-source row counts, then combine.
-    df_combined = pd.concat([
-        df_sp.assign(_source="swissprot"),
-        df_pfam.assign(_source="pfam"),
-    ], ignore_index=True)
-    logger.info("Combined dataset: %s rows", f"{len(df_combined):,}")
-    logger.info("  SwissProt: %s", f"{len(df_sp):,}")
-    logger.info("  Pfam:      %s", f"{len(df_pfam):,}")
+        # Always run enrich_dataframe to copy family columns into annot_* columns
+        df_pfam, join_stats = enrich_dataframe(
+            df_pfam,
+            local_annotations=local_annotations,
+            taxonomy_tree=taxonomy_tree,
+            accession_taxid_map=accession_taxid_map,
+            expasy_lookup=expasy_lookup,
+            brenda_lookup=brenda_lookup,
+            smart_lookup=smart_lookup,
+            organism_match=args.organism_match,
+        )
 
-    if args.taxonomy_filter:
-        df_combined = _apply_taxonomy_filters(df_combined, args)
+        # Step 2: Compose [final]text_caption from annotation columns (Pfam only).
+        # SwissProt rows already have ALL-CAPS captions from the source CSV.
+        df_pfam = compose_caption(df_pfam)
 
-    # Precompute common build_manifest fields
-    resolved_paths = {
-        "swissprot_csv": os.path.abspath(_resolve_swissprot_path(args)),
-        "pfam_csv": [os.path.abspath(p) for p in _resolve_pfam_paths(args)],
-    }
-    if args.use_expasy and args.expasy_csv:
-        resolved_paths["expasy_csv"] = os.path.abspath(args.expasy_csv)
-    if args.use_brenda and args.brenda_csv:
-        resolved_paths["brenda_csv"] = os.path.abspath(args.brenda_csv)
-    if args.use_smart and args.smart_csv:
-        resolved_paths["smart_csv"] = os.path.abspath(args.smart_csv)
+        # Track provenance so stats can report per-source row counts, then combine.
+        df_combined = pd.concat([
+            df_sp.assign(_source="swissprot"),
+            df_pfam.assign(_source="pfam"),
+        ], ignore_index=True)
+        logger.info("Combined dataset: %s rows", f"{len(df_combined):,}")
+        logger.info("  SwissProt: %s", f"{len(df_sp):,}")
+        logger.info("  Pfam:      %s", f"{len(df_pfam):,}")
 
-    database_versions = _get_database_versions(args)
-    if args.use_expasy and args.expasy_csv:
-        database_versions["expasy_csv"] = get_file_metadata(args.expasy_csv)
-    if args.use_brenda and args.brenda_csv:
-        database_versions["brenda_csv"] = get_file_metadata(args.brenda_csv)
-    if args.use_smart and args.smart_csv:
-        database_versions["smart_csv"] = get_file_metadata(args.smart_csv)
+        if args.taxonomy_filter:
+            df_combined = _apply_taxonomy_filters(df_combined, args)
 
-    if args.per_pfam_output:
-        # Per-Pfam subdirectories only — no aggregate output at top level.
-        for pid in args.pfam_ids:
-            subdir = os.path.join(args.outdir, pid)
-            os.makedirs(subdir, exist_ok=True)
-            mask = df_combined["pfam_label"].apply(
-                lambda s: _row_has_pfam(s, pid)
-            )
-            df_pid = df_combined[mask].reset_index(drop=True)
-            per_pid_row_counts = {
-                "swissprot": int((df_pid["_source"] == "swissprot").sum()),
-                "pfam": int((df_pid["_source"] == "pfam").sum()),
-                "combined": len(df_pid),
+        # Precompute common build_manifest fields
+        resolved_paths = {
+            "swissprot_csv": os.path.abspath(_resolve_swissprot_path(args)),
+            "pfam_csv": [os.path.abspath(p) for p in _resolve_pfam_paths(args)],
+        }
+        if args.use_expasy and args.expasy_csv:
+            resolved_paths["expasy_csv"] = os.path.abspath(args.expasy_csv)
+        if args.use_brenda and args.brenda_csv:
+            resolved_paths["brenda_csv"] = os.path.abspath(args.brenda_csv)
+        if args.use_smart and args.smart_csv:
+            resolved_paths["smart_csv"] = os.path.abspath(args.smart_csv)
+
+        database_versions = _get_database_versions(args)
+        if args.use_expasy and args.expasy_csv:
+            database_versions["expasy_csv"] = get_file_metadata(args.expasy_csv)
+        if args.use_brenda and args.brenda_csv:
+            database_versions["brenda_csv"] = get_file_metadata(args.brenda_csv)
+        if args.use_smart and args.smart_csv:
+            database_versions["smart_csv"] = get_file_metadata(args.smart_csv)
+
+        if args.per_pfam_output:
+            # Per-Pfam subdirectories only — no aggregate output at top level.
+            for pid in args.pfam_ids:
+                subdir = os.path.join(args.outdir, pid)
+                os.makedirs(subdir, exist_ok=True)
+                mask = df_combined["pfam_label"].apply(
+                    lambda s: _row_has_pfam(s, pid)
+                )
+                df_pid = df_combined[mask].reset_index(drop=True)
+                per_pid_row_counts = {
+                    "swissprot": int((df_pid["_source"] == "swissprot").sum()),
+                    "pfam": int((df_pid["_source"] == "pfam").sum()),
+                    "combined": len(df_pid),
+                }
+                _write_dataset_outputs(
+                    df_pid, subdir, [pid], args,
+                    start_time=start_time, elapsed_fn=lambda: datetime.now() - start_time,
+                    row_counts=per_pid_row_counts,
+                    join_stats=join_stats,
+                    resolved_paths=resolved_paths,
+                    database_versions=database_versions,
+                    stats_title=f"dataset/{pid} — coverage stats",
+                )
+        else:
+            aggregate_row_counts = {
+                "swissprot": len(df_sp),
+                "pfam": len(df_pfam),
+                "combined": len(df_combined),
             }
             _write_dataset_outputs(
-                df_pid, subdir, [pid], args,
+                df_combined, args.outdir, args.pfam_ids, args,
                 start_time=start_time, elapsed_fn=lambda: datetime.now() - start_time,
-                row_counts=per_pid_row_counts,
+                row_counts=aggregate_row_counts,
                 join_stats=join_stats,
                 resolved_paths=resolved_paths,
                 database_versions=database_versions,
-                stats_title=f"dataset/{pid} — coverage stats",
+                stats_title="dataset — coverage stats",
             )
-    else:
-        aggregate_row_counts = {
-            "swissprot": len(df_sp),
-            "pfam": len(df_pfam),
-            "combined": len(df_combined),
-        }
-        _write_dataset_outputs(
-            df_combined, args.outdir, args.pfam_ids, args,
-            start_time=start_time, elapsed_fn=lambda: datetime.now() - start_time,
-            row_counts=aggregate_row_counts,
-            join_stats=join_stats,
-            resolved_paths=resolved_paths,
-            database_versions=database_versions,
-            stats_title="dataset — coverage stats",
-        )
 
-    logger.info("Done in %s", datetime.now() - start_time)
-    logger.info("Log saved to %s", log_path)
-
-    # Clean up file handler
-    teardown_file_logging("biom3.dbio", file_handler)
+        logger.info("Done in %s", datetime.now() - start_time)
+        logger.info("Log saved to %s", log_path)
+    finally:
+        teardown_file_logging("biom3.dbio", file_handler)
 
 
 def _write_dataset_outputs(df, outdir, pfam_ids, args, *,

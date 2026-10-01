@@ -46,6 +46,7 @@ from biom3.core.run_utils import setup_file_logging, teardown_file_logging
 from biom3.core.distributed import get_global_rank
 from biom3.backend.device import (
     print_gpu_initialization, setup_logger, set_float32_matmul_precision,
+    resolve_device, check_devices_per_node,
 )
 
 logger = setup_logger(__name__)
@@ -354,7 +355,14 @@ def main(args, ds_config=None):
     logging.getLogger("tensorboardX.x2num").setLevel(logging.ERROR)
 
     # ----- Dry-run preview (no training executed) -----
-    if getattr(args, 'dry_run', False):
+    # A dry run only probes config, data and model, so it may land on CPU; a
+    # real run must find a GPU unless --device cpu was asked for explicitly.
+    dry_run = getattr(args, 'dry_run', False)
+    args.device = resolve_device(args.device, allow_cpu=dry_run)
+    if not dry_run:
+        check_devices_per_node(args.device, args.devices_per_node)
+
+    if dry_run:
         return run_dry_run(
             args,
             stage="stage3_finetune",
@@ -371,132 +379,132 @@ def main(args, ds_config=None):
         os.makedirs(artifacts_dir, exist_ok=True)
         os.makedirs(checkpoint_dir, exist_ok=True)
     log_path, file_handler = setup_file_logging(artifacts_dir)
-
-    set_float32_matmul_precision(args.float32_matmul_precision)
-    base.clear_gpu_cache()
-
-    seed = args.seed
-    if seed <= 0:
-        seed = np.random.randint(2**32)
-        args.seed = seed
-    base.set_seed(seed)
-    logger.info("Using seed: %s", seed)
-
-    stage1_args, stage2_args = load_embedder_configs(args)
-    data_module = load_data(args, stage1_args=stage1_args)
-    PL_model = load_model(
-        args, data_module=data_module,
-        stage1_args=stage1_args, stage2_args=stage2_args,
-    )
-
-    # Finetuning script: freeze the base and expose only the requested trainable
-    # subset. requires_grad flags are not persisted in Lightning checkpoints, so
-    # this is re-applied on resume too. LoRA is an alternative to block-freezing.
-    if getattr(args, "use_lora", False):
-        from biom3.Stage3.lora import apply_lora_finetuning
-        # LoRA and block-freezing are mutually exclusive strategies: under LoRA the
-        # whole base is frozen and only adapters (+ y_mlp) train, so the
-        # block-freezing selectors do not apply. Warn if they were set to anything
-        # other than the "all/unspecified" sentinels so the ignore isn't silent.
-        if (args.finetune_last_n_blocks not in (-1, -2)
-                or args.finetune_last_n_layers not in (-1, -2)
-                or args.finetune_output_layers):
-            logger.warning(
-                "use_lora=True: ignoring block-freezing args "
-                "(finetune_last_n_blocks=%s, finetune_last_n_layers=%s, "
-                "finetune_output_layers=%s). LoRA freezes the full base and trains "
-                "only the adapters + y_mlp.",
-                args.finetune_last_n_blocks, args.finetune_last_n_layers,
-                args.finetune_output_layers,
-            )
-        PL_model = apply_lora_finetuning(
-            PL_model,
-            r=args.lora_r,
-            alpha=args.lora_alpha,
-            dropout=args.lora_dropout,
-            target_patterns=args.lora_target_patterns,
-            unfreeze_y_mlp=args.lora_unfreeze_y_mlp,
-        )
-    else:
-        PL_model = base.freeze_except_last_n_blocks_and_layers(
-            PL_model=PL_model,
-            n_blocks=args.finetune_last_n_blocks,
-            n_layers=args.finetune_last_n_layers,
-            finetune_output_layers=args.finetune_output_layers,
-        )
-
-    base._write_build_manifest(
-        args=args,
-        artifacts_dir=artifacts_dir,
-        checkpoint_dir=checkpoint_dir,
-        PL_model=PL_model,
-        start_time=start_time,
-    )
-
-    exit_reason = "completed"
-    exception = None
     try:
-        base.train_model(
-            args=args,
-            PL_model=PL_model,
-            data_module=data_module,
-            ds_config=ds_config,
+        set_float32_matmul_precision(args.float32_matmul_precision)
+        base.clear_gpu_cache()
+
+        seed = args.seed
+        if seed <= 0:
+            seed = np.random.randint(2**32)
+            args.seed = seed
+        base.set_seed(seed)
+        logger.info("Using seed: %s", seed)
+
+        stage1_args, stage2_args = load_embedder_configs(args)
+        data_module = load_data(args, stage1_args=stage1_args)
+        PL_model = load_model(
+            args, data_module=data_module,
+            stage1_args=stage1_args, stage2_args=stage2_args,
         )
-    except KeyboardInterrupt as e:
-        exit_reason = "interrupted"
-        exception = e
-        raise
-    except BaseException as e:
-        exit_reason = "exception"
-        exception = e
-        raise
-    finally:
-        time_limit_seconds = getattr(args, 'time_limit_seconds', None)
-        if exit_reason == "completed" and time_limit_seconds is not None:
-            elapsed = time.perf_counter() - base._MAIN_START_MONOTONIC
-            if elapsed >= time_limit_seconds:
-                exit_reason = "time_limit_exceeded"
-        completed_epochs = (
-            base._LAST_TRAINER.current_epoch if base._LAST_TRAINER is not None else None
-        )
-        completed_steps = (
-            base._LAST_TRAINER.global_step if base._LAST_TRAINER is not None else None
-        )
-        base._write_run_summary(
-            artifacts_dir=artifacts_dir,
-            start_time=start_time,
-            exit_reason=exit_reason,
-            exception=exception,
-            completed_epochs=completed_epochs,
-            completed_steps=completed_steps,
-        )
-        # LoRA runs emit BOTH the small adapter delta (portable, per-family) and
-        # the full merged plain ProteoScribe checkpoint (drop-in for continued
-        # training / downstream). Rank 0 only; ZeRO-2 replicates params so
-        # PL_model.model is complete. Merge mutates the model in place, so do this
-        # after the run summary and guard it so an export hiccup is non-fatal.
-        if (getattr(args, "use_lora", False)
-                and exit_reason in ("completed", "time_limit_exceeded")
-                and get_global_rank() == 0):
-            try:
-                from biom3.Stage3.lora import export_lora_finetuned
-                export_lora_finetuned(
-                    PL_model.model,
-                    lora_path=os.path.join(artifacts_dir, "lora_weights.pt"),
-                    merged_path=os.path.join(artifacts_dir, "state_dict.merged.pth"),
-                    target_patterns=args.lora_target_patterns,
+
+        # Finetuning script: freeze the base and expose only the requested trainable
+        # subset. requires_grad flags are not persisted in Lightning checkpoints, so
+        # this is re-applied on resume too. LoRA is an alternative to block-freezing.
+        if getattr(args, "use_lora", False):
+            from biom3.Stage3.lora import apply_lora_finetuning
+            # LoRA and block-freezing are mutually exclusive strategies: under LoRA the
+            # whole base is frozen and only adapters (+ y_mlp) train, so the
+            # block-freezing selectors do not apply. Warn if they were set to anything
+            # other than the "all/unspecified" sentinels so the ignore isn't silent.
+            if (args.finetune_last_n_blocks not in (-1, -2)
+                    or args.finetune_last_n_layers not in (-1, -2)
+                    or args.finetune_output_layers):
+                logger.warning(
+                    "use_lora=True: ignoring block-freezing args "
+                    "(finetune_last_n_blocks=%s, finetune_last_n_layers=%s, "
+                    "finetune_output_layers=%s). LoRA freezes the full base and trains "
+                    "only the adapters + y_mlp.",
+                    args.finetune_last_n_blocks, args.finetune_last_n_layers,
+                    args.finetune_output_layers,
                 )
-            except Exception as e:  # pragma: no cover
-                logger.warning("LoRA export failed (non-fatal): %s", e)
-        if base._MAIN_START_MONOTONIC is not None:
-            total = int(time.perf_counter() - base._MAIN_START_MONOTONIC)
-            h, rem = divmod(total, 3600)
-            m, s = divmod(rem, 60)
-            logger.info(
-                "Program exiting. Total elapsed time: %d:%02d:%02d", h, m, s,
+            PL_model = apply_lora_finetuning(
+                PL_model,
+                r=args.lora_r,
+                alpha=args.lora_alpha,
+                dropout=args.lora_dropout,
+                target_patterns=args.lora_target_patterns,
+                unfreeze_y_mlp=args.lora_unfreeze_y_mlp,
+            )
+        else:
+            PL_model = base.freeze_except_last_n_blocks_and_layers(
+                PL_model=PL_model,
+                n_blocks=args.finetune_last_n_blocks,
+                n_layers=args.finetune_last_n_layers,
+                finetune_output_layers=args.finetune_output_layers,
             )
 
-    teardown_file_logging("biom3", file_handler)
+        base._write_build_manifest(
+            args=args,
+            artifacts_dir=artifacts_dir,
+            checkpoint_dir=checkpoint_dir,
+            PL_model=PL_model,
+            start_time=start_time,
+        )
+
+        exit_reason = "completed"
+        exception = None
+        try:
+            base.train_model(
+                args=args,
+                PL_model=PL_model,
+                data_module=data_module,
+                ds_config=ds_config,
+            )
+        except KeyboardInterrupt as e:
+            exit_reason = "interrupted"
+            exception = e
+            raise
+        except BaseException as e:
+            exit_reason = "exception"
+            exception = e
+            raise
+        finally:
+            time_limit_seconds = getattr(args, 'time_limit_seconds', None)
+            if exit_reason == "completed" and time_limit_seconds is not None:
+                elapsed = time.perf_counter() - base._MAIN_START_MONOTONIC
+                if elapsed >= time_limit_seconds:
+                    exit_reason = "time_limit_exceeded"
+            completed_epochs = (
+                base._LAST_TRAINER.current_epoch if base._LAST_TRAINER is not None else None
+            )
+            completed_steps = (
+                base._LAST_TRAINER.global_step if base._LAST_TRAINER is not None else None
+            )
+            base._write_run_summary(
+                artifacts_dir=artifacts_dir,
+                start_time=start_time,
+                exit_reason=exit_reason,
+                exception=exception,
+                completed_epochs=completed_epochs,
+                completed_steps=completed_steps,
+            )
+            # LoRA runs emit BOTH the small adapter delta (portable, per-family) and
+            # the full merged plain ProteoScribe checkpoint (drop-in for continued
+            # training / downstream). Rank 0 only; ZeRO-2 replicates params so
+            # PL_model.model is complete. Merge mutates the model in place, so do this
+            # after the run summary and guard it so an export hiccup is non-fatal.
+            if (getattr(args, "use_lora", False)
+                    and exit_reason in ("completed", "time_limit_exceeded")
+                    and get_global_rank() == 0):
+                try:
+                    from biom3.Stage3.lora import export_lora_finetuned
+                    export_lora_finetuned(
+                        PL_model.model,
+                        lora_path=os.path.join(artifacts_dir, "lora_weights.pt"),
+                        merged_path=os.path.join(artifacts_dir, "state_dict.merged.pth"),
+                        target_patterns=args.lora_target_patterns,
+                    )
+                except Exception as e:  # pragma: no cover
+                    logger.warning("LoRA export failed (non-fatal): %s", e)
+            if base._MAIN_START_MONOTONIC is not None:
+                total = int(time.perf_counter() - base._MAIN_START_MONOTONIC)
+                h, rem = divmod(total, 3600)
+                m, s = divmod(rem, 60)
+                logger.info(
+                    "Program exiting. Total elapsed time: %d:%02d:%02d", h, m, s,
+                )
+    finally:
+        teardown_file_logging("biom3", file_handler)
 
 
 if __name__ == '__main__':

@@ -9,6 +9,13 @@ import torch.distributed as dist
 import esm
 from torch.nn.utils.weight_norm import weight_norm
 
+# Sentinel for "this row has no usable key" (a 'nan'-label row whose Pfam side
+# is empty). It must never compare equal to anything, including another
+# NO_KEY. Kept in step with preprocess.NO_KEY by
+# tests/stage1_tests/test_false_negative_mask.py rather than by an import, so
+# model.py does not pull in the data stack.
+NO_KEY = 0
+
 
 """
 functions and classes adapted from the following:
@@ -426,7 +433,8 @@ class pfam_PEN_CL(nn.Module):
             self,
             protein_embeddings: torch.Tensor,
             text_embeddings: torch.Tensor,
-            batch_size: int
+            batch_size: int,
+            keys: torch.Tensor = None
         ) -> tuple[torch.Tensor, torch.Tensor]:
         
         """
@@ -461,6 +469,12 @@ class pfam_PEN_CL(nn.Module):
         mask[:batch_size, batch_size:] = torch.eye(batch_size)
         # convert to correct device and convert to boolean
         mask = mask.to(protein_embeddings.device).bool()
+        # same-sequence / same-family false negatives; the diagonal is L_GC's
+        # positive, so it is cleared after the OR (a key always equals itself).
+        _M = 2 * batch_size
+        _idx = torch.arange(_M, device=protein_embeddings.device)
+        mask |= self._key_equality_mask(keys, _idx, _M)
+        mask[_idx, _idx] = False
 
         # matrix multiplication between model embeddings
         logits = (text_embeddings @ protein_embeddings.T) / self.temperature
@@ -504,27 +518,61 @@ class pfam_PEN_CL(nn.Module):
     # `row_index` holds this rank's global row indices into the gathered batch.
     # ------------------------------------------------------------------
 
-    def _homolog_mask_rows(self, row_index, M):
+    def _key_equality_mask(self, keys, index, M, transpose=False):
+        """[R, M] (or [M, R]) True where a row and a candidate share a key.
+
+        `keys` is [M, K] int64, one column per enabled rule -- sequence
+        identity (the same protein under a different caption) and Pfam family
+        (two items drawn on the same family). Both are false negatives the
+        index-rule homolog mask does not reach: at M = 49,152 a row has ~25
+        same-family candidates and a 5.6% chance of an identical-sequence one,
+        against the single (i, i +- N) pair the index rule covers.
+
+        A row whose key is NO_KEY matches nothing; guarding the row side is
+        enough, since that also kills NO_KEY == NO_KEY.
+
+        Callers MUST clear the row's positive column afterwards -- a key always
+        equals itself, so the diagonal (L_GC) or the homolog column (L_PFC)
+        would otherwise be masked and the loss would lose its numerator.
+        """
+        R = index.numel()
+        out = torch.zeros((M, R) if transpose else (R, M), dtype=torch.bool,
+                          device=index.device)
+        if keys is None:
+            return out
+        sel = keys[index]                                        # [R, K]
+        for c in range(keys.shape[1]):
+            row_k = sel[:, c].unsqueeze(1)                        # [R, 1]
+            hit = (row_k == keys[:, c].unsqueeze(0)) & (row_k != NO_KEY)
+            out |= hit.T if transpose else hit
+        return out
+
+    def _homolog_mask_rows(self, row_index, M, keys=None):
         """mask[row_index, :] for the inter-loss homolog mask, without building M x M.
 
         The dense mask marks (i, i+N) and (i+N, i): a Swiss-Prot entry and the
         Pfam homolog curated to match it. Those are false negatives and are
         excluded from the contrastive denominator.
+
+        With `keys`, same-sequence and same-family candidates join them. L_GC's
+        positive is the diagonal, so (i, i) is cleared last and unconditionally.
         """
         N = M // 2
-        out = torch.zeros((row_index.numel(), M), dtype=torch.bool,
-                          device=row_index.device)
+        ar = torch.arange(row_index.numel(), device=row_index.device)
+        out = self._key_equality_mask(keys, row_index, M)
         partner = torch.where(row_index < N, row_index + N, row_index - N)
-        out[torch.arange(row_index.numel(), device=row_index.device), partner] = True
+        out[ar, partner] = True
+        out[ar, row_index] = False
         return out
 
-    def _homolog_mask_cols(self, col_index, M):
+    def _homolog_mask_cols(self, col_index, M, keys=None):
         """mask[:, col_index] -- the transpose slice, same rule."""
         N = M // 2
-        out = torch.zeros((M, col_index.numel()), dtype=torch.bool,
-                          device=col_index.device)
+        ar = torch.arange(col_index.numel(), device=col_index.device)
+        out = self._key_equality_mask(keys, col_index, M, transpose=True)
         partner = torch.where(col_index < N, col_index + N, col_index - N)
-        out[partner, torch.arange(col_index.numel(), device=col_index.device)] = True
+        out[partner, ar] = True
+        out[col_index, ar] = False
         return out
 
     def compute_inter_loss_sharded(
@@ -534,6 +582,7 @@ class pfam_PEN_CL(nn.Module):
             batch_size: int,
             row_index: torch.Tensor,
             row_logZ: torch.Tensor,
+            keys: torch.Tensor = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
         """Row-sharded equivalent of compute_inter_loss.
 
@@ -549,8 +598,8 @@ class pfam_PEN_CL(nn.Module):
         tau = self.temperature
         two_tau = 2.0 * tau
 
-        mask_rows = self._homolog_mask_rows(row_index, M)          # [R, M]
-        mask_cols = self._homolog_mask_cols(row_index, M)          # [M, R]
+        mask_rows = self._homolog_mask_rows(row_index, M, keys)    # [R, M]
+        mask_cols = self._homolog_mask_cols(row_index, M, keys)    # [M, R]
 
         # --- text side: this rank's rows against all candidates ---
         ml_rows = self.set_inf((z_t[row_index] @ z_p.T) / tau, mask_rows)
@@ -577,11 +626,12 @@ class pfam_PEN_CL(nn.Module):
             protein_embeddings: torch.Tensor,
             text_embeddings: torch.Tensor,
             row_index: torch.Tensor,
+            keys: torch.Tensor = None,
         ) -> torch.Tensor:
         """logsumexp((mp + mt)/2tau) for this rank's rows -- all_gather this."""
         z_p, z_t = protein_embeddings, text_embeddings
         M = z_p.shape[0]
-        mask_rows = self._homolog_mask_rows(row_index, M)
+        mask_rows = self._homolog_mask_rows(row_index, M, keys)
         s_rows = self.set_inf(z_p[row_index] @ z_p.T, mask_rows) \
                + self.set_inf(z_t[row_index] @ z_t.T, mask_rows)
         return torch.logsumexp(s_rows / (2.0 * self.temperature), dim=-1)
@@ -591,6 +641,7 @@ class pfam_PEN_CL(nn.Module):
             protein_embeddings: torch.Tensor,
             batch_size: int,
             row_index: torch.Tensor,
+            keys: torch.Tensor = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
         """Row-sharded equivalent of compute_intra_loss. Rows only -- no transpose."""
         z_p = protein_embeddings
@@ -599,12 +650,14 @@ class pfam_PEN_CL(nn.Module):
         ar = torch.arange(R, device=z_p.device)
 
         cs = (z_p[row_index] @ z_p.T) / self.temperature            # [R, M]
-        self_mask = torch.zeros((R, M), dtype=torch.bool, device=z_p.device)
-        self_mask[ar, row_index] = True                             # exclude i == j
-        cs = self.set_inf(cs, self_mask)
-
         # dense pos_mask = eye(M).roll(M//2, dims=0): row i pairs with (i - M//2) % M
         pos_col = (row_index - M // 2) % M
+        # L_PFC's positive is the homolog column, so the key mask is cleared
+        # THERE, not on the diagonal -- the opposite of the inter loss.
+        drop = self._key_equality_mask(keys, row_index, M)
+        drop[ar, row_index] = True                                  # exclude i == j
+        drop[ar, pos_col] = False                                   # keep the positive
+        cs = self.set_inf(cs, drop)
         pos = cs[ar, pos_col]
         nll = -pos + torch.logsumexp(cs, dim=-1)
         return nll.mean(), cs.detach()
@@ -612,7 +665,8 @@ class pfam_PEN_CL(nn.Module):
     def compute_intra_loss(  
             self,
             protein_embeddings,
-            batch_size
+            batch_size,
+            keys: torch.Tensor = None
         ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the intra-modal contrastive InfoNCE loss for protein embeddings.
@@ -647,11 +701,15 @@ class pfam_PEN_CL(nn.Module):
         # mask cosine similarity matrix
         sample_size = protein_embeddings.shape[0]
         mask = torch.eye(sample_size, device=cosine_similarity.device, dtype=torch.bool)
+
+        # Find positive example -> batch_size //2 away from the original example (swiss-prot<>pfam)
+        # Built from a CLEAN eye: `mask` picks up the key hits just below.
+        pos_mask = mask.roll(shifts=mask.shape[0]//2, dims=0)
+
+        _idx = torch.arange(sample_size, device=cosine_similarity.device)
+        mask = (mask | self._key_equality_mask(keys, _idx, sample_size)) & ~pos_mask
         #cosine_similarity.masked_fill_(mask, float(-9e15))
         cosine_similarity = self.set_inf(cosine_similarity, mask)
-        
-        # Find positive example -> batch_size //2 away from the original example (swiss-prot<>pfam)
-        pos_mask = mask.roll(shifts=mask.shape[0]//2, dims=0)
 
         # InfoNCE loss
         nll = -cosine_similarity[pos_mask] + torch.logsumexp(cosine_similarity, dim=-1)
@@ -660,6 +718,49 @@ class pfam_PEN_CL(nn.Module):
             nll.mean(),
             cosine_similarity.cpu(),
         )
+
+    # ------------------------------------------------------------------
+    # Uniformity (Wang & Isola, 2020):
+    #   L_unif = log mean_{i != j} exp(-t ||x_i - x_j||^2),  x = z / ||z||
+    # On the unit sphere ||x_i - x_j||^2 = 2 - 2 x_i.x_j, so this is a
+    # log-mean-exp of 2t * cosine, minus 2t. Pairs (i, i) and the Swiss-Prot /
+    # Pfam homolog pair (i, i +- N) are excluded, so the term never pushes
+    # apart the pairs L_intra pulls together.
+    #
+    # The loss is one global log-mean-exp, so it is assembled from per-row
+    # logsumexps: dense computes all M rows, sharded computes this rank's rows
+    # and all_gathers them (see PL_wrapper._uniformity_losses).
+    # ------------------------------------------------------------------
+
+    def uniformity_row_logsumexp(
+            self,
+            embeddings: torch.Tensor,
+            row_index: torch.Tensor,
+            t: float,
+        ) -> torch.Tensor:
+        """logsumexp_j 2t * cos(z_i, z_j) over valid j, for each i in row_index."""
+        z = F.normalize(embeddings.float(), dim=-1)
+        M = z.shape[0]
+        mask = self._homolog_mask_rows(row_index, M)
+        mask[torch.arange(row_index.numel(), device=row_index.device), row_index] = True
+        s = (2.0 * t) * (z[row_index] @ z.T)
+        return torch.logsumexp(s.masked_fill(mask, float('-inf')), dim=-1)
+
+    @staticmethod
+    def uniformity_from_row_logsumexp(row_lse: torch.Tensor, t: float) -> torch.Tensor:
+        """Combine per-row logsumexps (all M rows, any order) into L_unif."""
+        M = row_lse.numel()
+        return torch.logsumexp(row_lse, dim=0) - np.log(M * (M - 2)) - 2.0 * t
+
+    def compute_uniformity_loss(
+            self,
+            embeddings: torch.Tensor,
+            t: float = 2.0,
+        ) -> torch.Tensor:
+        """Dense L_unif over the full gathered batch [M, D], M = 2N."""
+        rows = torch.arange(embeddings.shape[0], device=embeddings.device)
+        return self.uniformity_from_row_logsumexp(
+            self.uniformity_row_logsumexp(embeddings, rows, t), t)
 
     def set_inf(
             self,

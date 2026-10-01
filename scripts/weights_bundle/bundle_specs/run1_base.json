@@ -4,6 +4,7 @@
   "weights": {
     "LLMs/esm2_t33_650M_UR50D.pt": "weights/LLMs/esm2_t33_650M_UR50D.pt",
     "LLMs/esm2_t33_650M_UR50D-contact-regression.pt": "weights/LLMs/esm2_t33_650M_UR50D-contact-regression.pt",
+    "LLMs/ESM2_LICENSE.md": "weights/LLMs/ESM2_LICENSE.md",
     "LLMs/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext/config.json": "weights/LLMs/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext/config.json",
     "LLMs/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext/pytorch_model.bin": "weights/LLMs/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext/pytorch_model.bin",
     "LLMs/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext/tokenizer_config.json": "weights/LLMs/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext/tokenizer_config.json",

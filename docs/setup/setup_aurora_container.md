@@ -18,21 +18,26 @@ There are **two** Aurora images, and which one you want depends on node count:
 ## Why a separate image from the CUDA one
 
 Aurora's GPUs are Intel Data Center GPU Max (Ponte Vecchio), driven by oneAPI /
-Level-Zero — there is no CUDA. The `biom3:cuda` image would run on Aurora only on
-CPU. The XPU image instead installs `torch==2.8.0+xpu` with the matching
-`intel-extension-for-pytorch==2.8.10+xpu` — the newest public XPU pair, and one
-the `addison-nm/lightning` fork requires, since its `XPUAccelerator` raises
-without IPEX. Aurora's `module load frameworks` runs torch `2.10.0a0` with a
-non-public IPEX `2.10.10`, which the container cannot reproduce (native
-`torch.xpu`;
-Intel's IPEX is upstreamed into mainline torch, and `torch.distributed` uses the
-`xccl` backend). This mirrors how the CUDA image swaps in the cu129 wheel — see
-[PyTorch on Aurora](https://docs.alcf.anl.gov/aurora/data-science/frameworks/pytorch/).
+Level-Zero — there is no CUDA, so the `biom3:cuda` image would run there only on
+CPU. The Aurora images install Intel's `+xpu` torch wheels instead, with native
+`torch.xpu` and the `xccl` distributed backend:
+
+- `Dockerfile.xpu`: `torch==2.8.0+xpu`, plus `intel-extension-for-pytorch==2.8.10+xpu`,
+  kept because it is part of the stack this image was validated with. The
+  `addison-nm/lightning` fork no longer requires it.
+- `Dockerfile.xpu-oneapi`: `torch==2.10.0+xpu` on oneAPI 2025.3, the version under
+  Aurora's `frameworks/2025.3.1`, and no IPEX.
+
+Aurora's `module load frameworks` runs a source-built torch `2.10.0a0` that a
+container cannot reproduce; the oneapi image matches the oneAPI version beneath it.
+See [PyTorch on Aurora](https://docs.alcf.anl.gov/aurora/data-science/frameworks/pytorch/).
 
 ## Prerequisites
 
-- An x86_64 host with Docker to build + push the image (any dev box; Aurora nodes
-  have no Docker). Intel GPU torch wheels are x86_64-only.
+- A Docker host with buildx to build + push the images (Aurora nodes have no
+  Docker). The images are amd64-only, since Intel GPU torch wheels are x86_64-only:
+  an x86_64 host builds them natively, and an arm64 host builds them under QEMU
+  emulation (setup in [docker/README.md](../../docker/README.md#publishing-to-ghcr)).
 - GHCR push access for the one-time publish (see [cloud/README.md](../../cloud/README.md)
   and [docker/push.sh](../../docker/push.sh)). The published image is public, so
   the Aurora-side pull needs no login.
@@ -42,13 +47,14 @@ Intel's IPEX is upstreamed into mainline torch, and `torch.distributed` uses the
 ### 1. Build + push the XPU image (off Aurora)
 
 ```bash
-docker/build.sh --variant xpu --release       # -> ghcr.io/natural-machine/biom3:xpu-dev (+ :xpu-<sha>)
+REPO=ghcr.io/<org>/biom3
+docker/build.sh --variant xpu --release --repo "$REPO"   # -> $REPO:xpu-dev (+ :xpu-<sha>)
 ```
 
-`--release` builds and pushes in one pass. Unlike the cuda variant it stays
-**amd64-only**, so there is no manifest list to assemble. To publish an image you have
-already built locally, `docker/push.sh --variant xpu` pushes the same two tags without
-rebuilding.
+`--release` builds and pushes in one pass; `--repo` is required. Unlike the cuda
+variant it stays **amd64-only**, so there is no manifest list to assemble. To publish
+an image you have already built locally, `docker/push.sh --variant xpu --repo "$REPO"`
+pushes the same two tags without rebuilding.
 
 ### 2. Convert to a .sif (Aurora login node)
 
@@ -82,9 +88,11 @@ build host, `scp` it over, then
 
 ### 3. Smoke-test the GPUs (interactive, on a compute node)
 
-Grab an interactive node, then check that torch sees the 12 tiles:
+Grab an interactive node, point the wrapper at the image you built, then check that
+torch sees the 12 tiles:
 
 ```bash
+export BIOM3_IMAGE=/flare/NLDesignProtein/$USER/biom3_xpu.sif
 scripts/aurora/apptainer_run.sh python -c \
   "import torch; print('xpu', torch.xpu.is_available(), torch.xpu.device_count())"
 # expect: xpu True 12
@@ -96,16 +104,35 @@ matching `num_devices=12` in the PBS templates), and sources `environment.sh`
 inside the container — which fingerprints `/flare` to select the `aurora` profile
 and apply the oneCCL/`xccl`/NUMEXPR settings.
 
-### 4. Run a stage (single node)
+### 4. Run the test suite
 
 ```bash
-BIOM3_WEIGHTS_DIR=./weights BIOM3_DATA_DIR=./data \
-scripts/aurora/apptainer_run.sh scripts/stage3_train_singlenode.sh \
-    configs/stage3_training/pretrain_scratch_v1.json 12 xpu run001 --epochs 1
+scripts/aurora/apptainer_run.sh pytest tests/ --include_requires_gpu
 ```
 
-`BIOM3_WEIGHTS_DIR` / `BIOM3_DATA_DIR` are bind sources, so they must exist on the
-node. Use the repo's own `weights/` and `data/`. Binding the shared copy directly
+The tests write their scratch into the image at `/app/tests/_tmp`. The wrapper mounts
+`<outputs>/tests_tmp` there (override with `BIOM3_TESTS_TMP`), because the
+`--writable-tmpfs` overlay that absorbs other writes is too small for the suite.
+Everything a run writes therefore lands under the outputs directory; point
+`BIOM3_OUTPUTS_DIR` at a scratch location to keep test files out of your real
+`outputs/`.
+
+### 5. Run a stage (single node)
+
+```bash
+scripts/aurora/apptainer_run.sh scripts/stage3_train_singlenode.sh \
+    configs/stage3_training/pretrain_scratch_v1.json 12 auto run001 --epochs 1
+```
+
+The command is the same as on a CUDA machine except for the device count (`12`),
+which you always state: it is a layout choice, not something the wrapper infers.
+`auto` picks the XPU backend, and the run stops early if 12 devices are not visible.
+
+The wrappers mount the checkout's `weights/` and `data/` by default, with the same
+settings and defaults as `docker/run.sh` (see
+[docker/README.md](../../docker/README.md#getting-weights-and-data-into-the-container)).
+Set `BIOM3_WEIGHTS_DIR` / `BIOM3_DATA_DIR` to use other directories; they are
+mount sources, so they must exist on the node. Binding the shared copy directly
 needs its real layout — `BioM3-data-share/data/weights`, not
 `BioM3-data-share/weights` — and a path that does not exist fails every rank at
 container creation with `mount source ... doesn't exist`, before any Python runs.
@@ -123,8 +150,8 @@ and data are read-only. See the script header for all `BIOM3_*` knobs.
 
 ## Collectives: what works and what doesn't
 
-oneCCL inside the container needs three things that bare metal gets for free.
-All three are handled by [apptainer_run.sh](../../scripts/aurora/apptainer_run.sh);
+oneCCL inside the container needs several settings that bare metal gets for free.
+All of them are handled by [apptainer_run.sh](../../scripts/aurora/apptainer_run.sh);
 they are recorded here because the failure modes are opaque.
 
 | Need | Why | Failure if missing |
@@ -132,6 +159,8 @@ they are recorded here because the failure modes are opaque.
 | `libze_loader.so` symlink | oneCCL `dlopen`s the unversioned name, which only the `-dev` package ships. torch is unaffected — it links `.so.1` directly. | `could not open the library: libze_loader.so`, then `ze_data was not initialized` on every collective |
 | `FI_PROVIDER=tcp` | A shell with `module load frameworks` exports `cxi,tcp;ofi_rxm`; apptainer forwards it, and the container's libfabric has no cxi provider. | `fi_getinfo error: ret -61, providers 0` → `failed to initialize ATL` |
 | `CCL_PROCESS_LAUNCHER=torchrun` | The host sets `pmix`, but no PMIx server is reachable in the container. `torchrun` reads `LOCAL_RANK`/`LOCAL_WORLD_SIZE`. | `PMIx_Init failed: PMIX_ERR_UNREACH` → `local_idx >= 0 && local_idx < local_count failed` |
+| `CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0` | In the container the Level Zero fabric query reports no Xe Link between some tiles, so oneCCL treats the node as PCIe-connected and disables its device-to-device `topo` algorithm. Aurora's stacks are Xe Link connected, so the wrapper skips the check. | `topology recognition shows PCIe connection between devices`, repeated per rank, and slower collectives: 12-tile Stage 3 training ran at 0.38 it/s with the check versus 0.48 it/s without |
+| `CCL_ATL_TRANSPORT=ofi` | Under torchrun oneCCL finds no MPI launcher and falls back to `ofi` anyway. | `did not find MPI-launcher specific variables, switch to ATL/OFI`, once per rank (harmless) |
 
 **Single node** works with the above. GPU-to-GPU transfers use Level-Zero IPC
 rather than the fabric, so the tcp provider carries only out-of-band traffic.
@@ -158,18 +187,26 @@ Lightning falls back to a local environment, and every rank reports global rank
 0. `intel/oneapi-hpckit` supplies an Intel MPI that matches the host launcher.
 
 ```bash
-# 2 nodes, 24 tiles. Do not `module load frameworks` — the container carries its
-# own stack, and the module only exports host values the wrapper must override.
+# 2 nodes, 24 tiles. Run this from the shell `qsub -I` gives you: the wrapper
+# reads $PBS_NODEFILE, which PBS sets only there. Do not `module load frameworks`
+# — the container carries its own stack, and the module only exports host values
+# the wrapper must override.
 module load apptainer
+SIF=/flare/NLDesignProtein/$USER/biom3_xpu-oneapi.sif    # the oneapi .sif you built
+ls -d /opt/cray/libfabric/*/lib64                         # confirm BIOM3_FABRIC_DIR below
 
 NGPU_PER_NODE=12 NGPU_TOTAL=24 BIOM3_RANK_SOURCE=mpi \
 BIOM3_FABRIC_DIR=/opt/cray/libfabric/1.22.0/lib64 BIOM3_FI_PROVIDER=cxi \
-BIOM3_SIF=/flare/.../biom3_xpu-oneapi-<sha>.sif \
-BIOM3_WEIGHTS_DIR=./weights BIOM3_DATA_DIR=./data \
+BIOM3_IMAGE="$SIF" \
 scripts/aurora/apptainer_mpi_run.sh \
     biom3_train_stage3 --config_path configs/stage3_training/pretrain_scratch_v1.json \
-    --device xpu --devices_per_node 12 --num_nodes 2 --run_id run001 --epochs 2
+    --device auto --devices_per_node 12 --num_nodes 2 --run_id mn001 --epochs 2
 ```
+
+There is no progress bar on this path: under `mpiexec` each rank's stdout is a pipe,
+and `--progress_bar auto` shows the bar only on a terminal. Follow the run in
+TensorBoard or W&B, or from the per-epoch validation lines; `--progress_bar True`
+forces the bar, though the launcher may forward it in bursts.
 
 One additional setting this path needs, handled by the wrapper:
 `CCL_ZE_IPC_EXCHANGE=sockets`. Each rank is its own container with its own PID
@@ -238,3 +275,9 @@ and the container recipe in `_misc/sample_script.sh`.
   (`/app/tests/_tmp`, `.pytest_cache`). `apptainer_run.sh` passes
   `--writable-tmpfs` (an ephemeral RAM-backed overlay) to absorb these; if you
   invoke `apptainer exec` by hand, add `--writable-tmpfs` yourself.
+- **`OSError: [Errno 28] No space left on device` in the test suite.** The
+  `--writable-tmpfs` overlay is small. `apptainer_run.sh` mounts `<outputs>/tests_tmp`
+  at `/app/tests/_tmp` for this; if you invoke `apptainer exec` by hand, bind a host
+  dir there yourself (`--bind <dir>:/app/tests/_tmp`).
+- **`Failed to create user namespace` on `apptainer exec`.** You are on a login
+  node. Building the `.sif` works there, but running it needs a compute node.

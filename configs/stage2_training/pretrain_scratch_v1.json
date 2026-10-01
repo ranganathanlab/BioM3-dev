@@ -28,7 +28,7 @@
   "batch_size": 32,
   "acc_grad_batches": 1,
 
-  "device": "cuda",
+  "device": "auto",
   "precision": "32",
   "devices_per_node": 1,
   "num_gpus": 1,

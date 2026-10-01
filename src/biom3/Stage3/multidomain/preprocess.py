@@ -25,7 +25,7 @@ def encode_captions(text_tokenizer, captions, text_max_length):
     different embeddings because no attention mask reaches the text encoder (see
     docs/bug_reports/bert_embedding_mismatch.md).
     """
-    encoded = text_tokenizer.batch_encode_plus(
+    encoded = text_tokenizer(
         list(captions),
         truncation=True,
         max_length=text_max_length,

@@ -45,6 +45,16 @@ def _isolate_matmul_precision():
     finally:
         torch.set_float32_matmul_precision(prev)
 
+@pytest.fixture
+def no_process_group(monkeypatch):
+    """Take the single-process path despite a default process group that an
+    earlier in-process training test left initialized. On XPU, Lightning's
+    DeepSpeed strategy leaves one that cannot be destroyed: DeepSpeed caches a
+    clone of the world group (deepspeed.utils.groups._WORLD_GROUP), and later
+    Stage 3 runs fail on the stale handle."""
+    import torch.distributed as dist
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+
 
 def check_downloads(paths_to_check):
     """Returns list of missing files and a warning message."""

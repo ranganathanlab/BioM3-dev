@@ -77,7 +77,7 @@
   "task": "proteins",
   "max_steps": 3000000,
 
-  "device": "cuda",
+  "device": "auto",
   "precision": "bf16",
   "devices_per_node": 1,
   "num_nodes": 1,

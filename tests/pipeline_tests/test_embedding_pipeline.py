@@ -15,7 +15,8 @@ os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 from tests.conftest import DATDIR, TMPDIR, remove_dir, check_downloads
 
 import h5py
-from biom3.pipeline.embedding_pipeline import parse_arguments, main
+from biom3.pipeline.embedding_pipeline import parse_arguments, main, _build_stage3_argv
+from biom3.Stage3.run_ProteoScribe_sample import parse_arguments as parse_stage3_arguments
 
 pytestmark = [pytest.mark.slow]
 
@@ -78,11 +79,16 @@ def test_embedding_pipeline(expect_error_context, device):
             f"{prefix}.PenCL_emb.pt",
             f"{prefix}.Facilitator_emb.pt",
             f"{prefix}.compiled_emb.hdf5",
+            f"{prefix}.run.log",
+            f"{prefix}.build_manifest.json",
         ]
         for fname in expected_files:
             fpath = os.path.join(OUTPUTS_DIR, fname)
             if not os.path.isfile(fpath):
                 errors.append(f"Expected output file not found: {fpath}")
+        for fname in ["run.log", "build_manifest.json"]:
+            if os.path.exists(os.path.join(OUTPUTS_DIR, fname)):
+                errors.append(f"Unprefixed {fname} written to the output directory")
 
         # Verify HDF5 structure
         hdf5_path = os.path.join(OUTPUTS_DIR, f"{prefix}.compiled_emb.hdf5")
@@ -116,3 +122,42 @@ def test_cross_comparison_sample_limit_forwarded(extra_args, expected):
         "--prefix", "test",
     ] + extra_args)
     assert args.cross_comparison_sample_limit == expected
+
+
+@pytest.mark.parametrize("extra_args, expected", [
+    [[], None],
+    [["--num_replicas", "7"], 7],
+    [["--num_replicas", "None"], None],
+])
+def test_num_replicas_forwarded(extra_args, expected):
+    """--num_replicas reaches the Stage 3 sampler only when set."""
+    args = parse_arguments([
+        "-i", "in.csv",
+        "-o", OUTPUTS_DIR,
+        "--pencl_weights", "weights/PenCL/BioM3_PenCL_epoch20.bin",
+        "--facilitator_weights", "weights/Facilitator/BioM3_Facilitator_epoch20.bin",
+        "--pencl_config", "configs/inference/stage1_PenCL.json",
+        "--facilitator_config", "configs/inference/stage2_Facilitator.json",
+        "--prefix", "test",
+        "--generate",
+        "--proteoscribe_weights", "weights/ProteoScribe/model.bin",
+        "--proteoscribe_config", "configs/inference/stage3_ProteoScribe_sample.json",
+    ] + extra_args)
+    assert args.num_replicas == expected
+    stage3_argv = _build_stage3_argv(args, "facilitator.pt", "generated.pt")
+    assert ("--num_replicas" in stage3_argv) == (expected is not None)
+    assert parse_stage3_arguments(stage3_argv).num_replicas == expected
+
+
+def test_num_replicas_rejects_invalid():
+    with pytest.raises(SystemExit):
+        parse_arguments([
+            "-i", "in.csv",
+            "-o", OUTPUTS_DIR,
+            "--pencl_weights", "weights/PenCL/BioM3_PenCL_epoch20.bin",
+            "--facilitator_weights", "weights/Facilitator/BioM3_Facilitator_epoch20.bin",
+            "--pencl_config", "configs/inference/stage1_PenCL.json",
+            "--facilitator_config", "configs/inference/stage2_Facilitator.json",
+            "--prefix", "test",
+            "--num_replicas", "0",
+        ])

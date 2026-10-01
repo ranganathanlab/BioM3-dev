@@ -2,7 +2,7 @@
   "_base_configs": ["_base_runtime.json", "../stage3_training/models/_base_ProteoScribe_1block.json"],
   "_overwrite_configs": [],
 
-  "device": "cuda",
+  "device": "auto",
 
   "num_replicas": 5,
   "unmasking_order": "random",

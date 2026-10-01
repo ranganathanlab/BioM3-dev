@@ -381,7 +381,7 @@ def make_seq_caption_collate_fn(*, text_tokenizer, text_max_length, image_size,
             ).float()
             for sample in batch
         ])
-        text_inputs = text_tokenizer.batch_encode_plus(
+        text_inputs = text_tokenizer(
             [sample[caption_key] for sample in batch],
             truncation=True,
             max_length=text_max_length,

@@ -4,6 +4,7 @@ Tests script: src/biom3/Stage2/run_ProteoScribe_sample.py
 
 """
 
+import json
 import pytest
 import os
 from contextlib import nullcontext as does_not_raise
@@ -29,6 +30,7 @@ pytestmark = [pytest.mark.slow]
 ARGS_DIR = os.path.join(DATDIR, "entrypoint_args")
 OUTPUTS_DIR = os.path.join(TMPDIR, "outputs", "stage3_sample")
 CKPT_DIR = os.path.join(TMPDIR, "checkpoints")
+NUM_REPLICAS_DIR = os.path.join(TMPDIR, "outputs", "stage3_sample_num_replicas")
 
 # Required weights that need to be downloaded to run entrypoint test
 REQUIRED_DOWNLOADS = [
@@ -265,3 +267,87 @@ def test_checkpoint_and_weights_produce_same_output(mini_checkpoint_path, device
         assert seqs_raw == seqs_ckpt, (
             f"{key} mismatch:\n  raw:  {seqs_raw}\n  ckpt: {seqs_ckpt}"
         )
+
+
+###############################################################################
+###########################   NUM REPLICAS TESTS   ############################
+###############################################################################
+
+REQUIRED_PATH_ARGS = ["-i", "in.pt", "-c", "config.json", "-m", "model.pth", "-o", "out.pt"]
+
+
+@pytest.mark.parametrize("cli, expected", [
+    [[], None],
+    [["--num_replicas", "4"], 4],
+    [["--num_replicas", "None"], None],
+])
+def test_parse_num_replicas(cli, expected):
+    args = parse_arguments(REQUIRED_PATH_ARGS + cli)
+    assert args.num_replicas == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "two", "2.5"])
+def test_parse_num_replicas_rejects(value):
+    with pytest.raises(SystemExit):
+        parse_arguments(REQUIRED_PATH_ARGS + ["--num_replicas", value])
+
+
+OMIT = object()
+
+
+def _write_mini_config(num_replicas):
+    """Write the mini config with num_replicas set, or removed when OMIT."""
+    config = load_json_config(MINI_CONFIG)
+    config.pop("num_replicas", None)
+    if num_replicas is not OMIT:
+        config["num_replicas"] = num_replicas
+    os.makedirs(NUM_REPLICAS_DIR, exist_ok=True)
+    path = os.path.join(NUM_REPLICAS_DIR, "config.json")
+    with open(path, "w") as f:
+        json.dump(config, f)
+    return path
+
+
+@pytest.mark.parametrize("cli, config_num_replicas, expected", [
+    [["--num_replicas", "3"], 2, 3],
+    [["--num_replicas", "None"], 2, 2],
+    [[], OMIT, 5],
+    [[], None, 5],
+    [[], "None", 5],
+])
+def test_num_replicas_resolution(cli, config_num_replicas, expected):
+    config_path = _write_mini_config(config_num_replicas)
+    output_path = os.path.join(NUM_REPLICAS_DIR, "samples.pt")
+    args = parse_arguments([
+        "-i", TEST_EMBEDDINGS,
+        "-c", config_path,
+        "-m", MINI_WEIGHTS,
+        "-o", output_path,
+        "--device", "cpu",
+    ] + cli)
+    main(args)
+    result = torch.load(output_path)
+    with open(os.path.join(NUM_REPLICAS_DIR, "build_manifest.json")) as f:
+        manifest = json.load(f)
+    remove_dir(NUM_REPLICAS_DIR)
+    assert result["_metadata"]["num_replicas"] == expected
+    prompt_keys = [k for k in result if not k.startswith("_")]
+    assert prompt_keys
+    assert all(len(result[k]) == expected for k in prompt_keys)
+    assert manifest["outputs"]["num_replicas"] == expected
+
+
+def test_num_replicas_invalid_config_value():
+    config_path = _write_mini_config(0)
+    args = parse_arguments([
+        "-i", TEST_EMBEDDINGS,
+        "-c", config_path,
+        "-m", MINI_WEIGHTS,
+        "-o", os.path.join(NUM_REPLICAS_DIR, "samples.pt"),
+        "--device", "cpu",
+    ])
+    try:
+        with pytest.raises(ValueError, match="config num_replicas must be a positive integer"):
+            main(args)
+    finally:
+        remove_dir(NUM_REPLICAS_DIR)

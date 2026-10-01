@@ -5,6 +5,7 @@ Tests script: src/biom3/Stage3/run_PL_training.py
 """
 
 import pytest
+import logging
 import os
 from contextlib import nullcontext as does_not_raise
 
@@ -184,6 +185,13 @@ def test_train_from_pretrained_weights(
     if expect_error:
         with pytest.raises(RuntimeError, match=r"Error\(s\) in loading state_dict"):
             main(args)
+        leaked = sorted({
+            h.baseFilename
+            for lg in logging.Logger.manager.loggerDict.values()
+            if isinstance(lg, logging.Logger)
+            for h in lg.handlers if isinstance(h, logging.FileHandler)
+        })
+        assert not leaked, f"run.log handler left open after error: {leaked}"
         remove_dir(OUTPUTS_DIR)
         return
     

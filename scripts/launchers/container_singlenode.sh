@@ -5,8 +5,8 @@
 #
 # USAGE: container_singlenode.sh ENTRYPOINT [args...]
 #
-# DESCRIPTION: Single-node launcher for containerized commercial-cloud
-#   environments (AWS / Mithril GPU instances; BIOM3_MACHINE=container).
+# DESCRIPTION: Single-node launcher inside a BioM3 Docker container, on any
+#   host (a workstation or a cloud GPU instance; BIOM3_MACHINE=container).
 #   Required env: NGPU (number of GPUs visible in the container).
 #
 #   Unlike the ALCF HPC launchers (Aurora/Polaris), there is no PBS, no
@@ -22,8 +22,7 @@
 #   --standalone picks a free MASTER_PORT on 127.0.0.1, so concurrent
 #   containers on the same host can't collide.
 #
-#   Multi-node (across instances) is intentionally not supported here; see
-#   docker/README.md for the rationale and the follow-up path.
+#   Multi-node (across instances) is container_multinode.sh.
 #
 #=============================================================================
 set -euo pipefail

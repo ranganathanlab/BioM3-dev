@@ -2,7 +2,7 @@
 
 import pytest
 
-from biom3.core.helpers import coerce_limit_batches
+from biom3.core.helpers import coerce_limit_batches, optional_positive_int
 
 
 @pytest.mark.parametrize("value, expected, expected_type", [
@@ -24,3 +24,26 @@ def test_coerce_limit_batches(value, expected, expected_type):
     result = coerce_limit_batches(value)
     assert result == expected
     assert type(result) is expected_type
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, None),
+    ("None", None),
+    ("none", None),
+    ("", None),
+    ("  ", None),
+    (3, 3),
+    ("3", 3),
+    (" 12 ", 12),
+    (5.0, 5),
+])
+def test_optional_positive_int(value, expected):
+    result = optional_positive_int(value)
+    assert result == expected
+    assert result is None or type(result) is int
+
+
+@pytest.mark.parametrize("value", [0, -1, "0", "-2", "abc", "2.5", 2.5, True, False, [3]])
+def test_optional_positive_int_rejects(value):
+    with pytest.raises(ValueError, match="num_replicas must be a positive integer"):
+        optional_positive_int(value, name="num_replicas")

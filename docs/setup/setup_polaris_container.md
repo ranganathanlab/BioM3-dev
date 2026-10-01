@@ -17,7 +17,7 @@ for the bare-metal multi-node path.
 - The public CUDA image on GHCR: `ghcr.io/natural-machine/biom3:cuda-dev`. It is a
   multi-arch manifest list, so Polaris pulls the `linux/amd64` half automatically. If
   it is not already pushed, publish it from any Docker host (either architecture):
-  `docker/build.sh --variant cuda --awscli --release` — see
+  `docker/build.sh --variant cuda --release --repo ghcr.io/<org>/biom3` — see
   [docker/README.md](../../docker/README.md#publishing-to-ghcr) for the build-host
   requirements.
 - No GHCR login needed for the pull (the image is public).
@@ -74,7 +74,7 @@ scripts/polaris/apptainer_run.sh python -c \
 BIOM3_WEIGHTS_DIR=/grand/NLDesignProtein/sharepoint/BioM3-data-share/weights \
 BIOM3_DATA_DIR=/grand/NLDesignProtein/sharepoint/BioM3-data-share/data \
 scripts/polaris/apptainer_run.sh scripts/stage3_train_singlenode.sh \
-    configs/stage3_training/pretrain_scratch_v1.json 4 cuda run001 --epochs 1
+    configs/stage3_training/pretrain_scratch_v1.json 4 auto run001 --epochs 1
 ```
 
 Host dirs bind onto `/app/{weights,data,outputs}`; `outputs/` is writable, weights
@@ -96,6 +96,7 @@ and data are read-only. See the script header for all `BIOM3_*` knobs.
   The `.sif` is read-only, and some code writes into the image tree
   (`/app/tests/_tmp`, `.pytest_cache`). `apptainer_run.sh` passes
   `--writable-tmpfs` (an ephemeral RAM-backed overlay) to absorb these; if you
-  invoke `apptainer exec` by hand, add `--writable-tmpfs` yourself. If your site
-  disables overlay support, bind a writable host dir instead, e.g.
-  `--bind $PWD/_tmp:/app/tests/_tmp`.
+  invoke `apptainer exec` by hand, add `--writable-tmpfs` yourself. The test suite
+  writes more than that overlay holds, so `apptainer_run.sh` also mounts
+  `<outputs>/tests_tmp` at `/app/tests/_tmp` (override with `BIOM3_TESTS_TMP`); by
+  hand, add `--bind <dir>:/app/tests/_tmp`.

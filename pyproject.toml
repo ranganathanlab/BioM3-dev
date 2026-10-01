@@ -35,6 +35,7 @@ where = ["src"]
 "biom3.app" = ["*.json"]
 
 [project.scripts]
+biom3 = "biom3.cli:main"
 biom3_train_stage1 = "biom3.Stage1.__main__:run_stage1_training"
 biom3_train_stage2 = "biom3.Stage2.__main__:run_stage2_training"
 biom3_train_stage3 = "biom3.Stage3.__main__:run_stage3_training"
@@ -48,6 +49,8 @@ biom3_grpo_train = "biom3.rl.__main__:run_grpo_train"
 biom3_gdpo_train = "biom3.rl.__main__:run_gdpo_train"
 biom3_dpo_train = "biom3.rl.__main__:run_dpo_train"
 biom3_compile_hdf5 = "biom3.data_prep.__main__:run_compile_hdf5"
+biom3_fetch_weights = "biom3.weights.__main__:run_fetch_weights"
+biom3_fetch_dataset = "biom3.datasets.__main__:run_fetch_dataset"
 biom3_embedding_pipeline = "biom3.pipeline.__main__:run_embedding_pipeline"
 biom3_fit_manifold = "biom3.geometry.__main__:run_fit_manifold"
 biom3_score_manifold = "biom3.geometry.__main__:run_score_manifold"

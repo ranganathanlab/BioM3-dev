@@ -20,12 +20,29 @@ source "venvs/${env_name}/bin/activate"
 # Install custom lightning package
 python -m pip install git+https://github.com/addison-nm/lightning.git --no-build-isolation
 # Install BioM3
-python -m pip install -e .
+python -m pip install -e '.[app]'
 # Install additional dependencies
 python -m pip install -r requirements/aurora.txt
+# h5py must be venv-local: the frameworks build links an OpenSSL that
+# conflicts with the system libssl once hashlib is imported first.
+python -m pip install --ignore-installed --no-cache-dir h5py
 ```
 
 Note that presently an error message may be raised due to package conflicts, but the installation should still work.
+
+Verify the h5py install before going further, each line in a fresh interpreter:
+
+```bash
+python -c "import h5py; print(h5py.__file__)"           # must be under .../venvs/biom3-env/
+python -c "import hashlib, pandas; import h5py; print('ok')"
+```
+
+The second line is the real check. The frameworks h5py links an OpenSSL that conflicts with
+the system `libssl` as soon as `hashlib` is loaded first, and pandas imports hashlib — so
+`biom3_train_stage3` fails on `import h5py` while a plain `import h5py` succeeds. Running the
+test suite does not check this: pytest imports every test module at collection, and
+`tests/data_prep_tests/` sorts before `tests/dbio_tests/`, so h5py always binds before pandas
+and every later import is a no-op.
 
 ## Usage
 

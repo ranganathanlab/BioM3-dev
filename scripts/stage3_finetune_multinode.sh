@@ -6,6 +6,8 @@
 # USAGE: stage3_finetune_multinode.sh CONFIG_PATH NUM_NODES NGPU_PER_NODE \
 #        DEVICE RUN_ID [additional --key value overrides]
 #
+#   DEVICE: cuda | xpu | cpu | auto (auto = the detected GPU backend; never CPU)
+#
 # DESCRIPTION: Multi-node wrapper for Stage 3 GENERALIZED finetuning
 #   (biom3_finetune_stage3 / run_ProteoScribe_finetuning). Unlike
 #   stage3_train_multinode.sh (which drives biom3_train_stage3 on precomputed

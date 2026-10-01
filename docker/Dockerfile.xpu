@@ -8,17 +8,18 @@
 # x86_64 — so, unlike the CUDA variant, there is no arm64 build here.
 #
 # TARGET = Aurora, run under Apptainer (NOT docker). The usual flow is:
-#   docker/build.sh --variant xpu --release                         # -> :xpu-dev + :xpu-<sha>
-#   apptainer build biom3_xpu.sif docker://ghcr.io/.../biom3:xpu-dev  # on Aurora
+#   docker/build.sh --variant xpu --release --repo ghcr.io/<org>/biom3  # -> :xpu-dev + :xpu-<sha>
+#   apptainer build biom3_xpu.sif docker://ghcr.io/<org>/biom3:xpu-dev   # on Aurora
 #   scripts/aurora/apptainer_run.sh <cmd>    # binds /flare, runs
 # See docs/setup/setup_aurora_container.md for the full runbook.
-# It can also `docker run` on any local Intel-GPU host (see docker/run.sh, which
-# maps :xpu tags to `--device /dev/dri`).
+# It can also `docker run` on a local Intel-GPU host (docker/run.sh maps :xpu
+# tags to `--device /dev/dri`). The entrypoint does not source environment.sh,
+# so run `source environment.sh` before the scripts/*_train_*.sh wrappers there.
 #
 # GPU ENABLEMENT — how this actually reaches Aurora's Ponte Vecchio GPUs:
 #   * torch==2.8.0+xpu (below) has native torch.xpu, and torch.distributed uses
-#     the native `xccl` backend (not the old `ccl`). IPEX is installed anyway:
-#     the lightning fork's XPUAccelerator gates on it (see that layer below).
+#     the native `xccl` backend (not the old `ccl`). IPEX is installed too; see
+#     that layer below for why.
 #   * The torch wheel vendors the SYCL/DPC++ *runtime*. What must come from
 #     OUTSIDE the wheel is the Level-Zero loader + the Intel L0 GPU *driver*
 #     (libze_intel_gpu). We install those from Intel's GPU apt repo so the image

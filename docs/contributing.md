@@ -18,18 +18,18 @@ The short version: **branch from `dev`, PR back into `dev`**. Releases out of `d
 
 ## 1. Clone the repository
 
-External contributors should first **fork** the repo on GitHub (top-right "Fork" button on [github.com/addison-nm/BioM3-dev](https://github.com/addison-nm/BioM3-dev)), then clone your fork:
+External contributors should first **fork** the repo on GitHub (top-right "Fork" button on [github.com/ranganathanlab/BioM3-dev](https://github.com/ranganathanlab/BioM3-dev)), then clone your fork:
 
 ```bash
 git clone https://github.com/<your-username>/BioM3-dev.git
 cd BioM3-dev
-git remote add upstream https://github.com/addison-nm/BioM3-dev.git
+git remote add upstream https://github.com/ranganathanlab/BioM3-dev.git
 ```
 
-Internal collaborators with push access to `addison-nm/BioM3-dev` can clone the repo directly without forking:
+Internal collaborators with push access to `ranganathanlab/BioM3-dev` can clone the repo directly without forking:
 
 ```bash
-git clone https://github.com/addison-nm/BioM3-dev.git
+git clone https://github.com/ranganathanlab/BioM3-dev.git
 cd BioM3-dev
 ```
 
@@ -105,7 +105,7 @@ refactor: extract raw-weight and checkpoint loaders in run_PenCL_inference
 Use the commit body (after a blank line) for the *why* if it isn't obvious from the summary. Push your branch to your remote:
 
 ```bash
-# Internal contributors (push to origin = addison-nm/BioM3-dev)
+# Internal contributors (push to origin = ranganathanlab/BioM3-dev)
 git push -u origin <your-branch-name>
 
 # External contributors (push to your fork)
@@ -114,7 +114,7 @@ git push -u origin <your-branch-name>
 
 ## 4. Open a pull request
 
-Once your branch is pushed, open a PR against the `dev` branch of `addison-nm/BioM3-dev`.
+Once your branch is pushed, open a PR against the `dev` branch of `ranganathanlab/BioM3-dev`.
 
 **Via the GitHub web UI:** GitHub will prompt you with a "Compare & pull request" banner after pushing. Click it, then **make sure the base branch is set to `dev` (not `main`)**. Fill in the title and description and submit.
 

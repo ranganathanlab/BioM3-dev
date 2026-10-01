@@ -15,6 +15,7 @@ import copy
 import re
 import zlib
 import json
+import hashlib
 from datetime import datetime
 
 import numpy as np
@@ -208,7 +209,7 @@ def collate_fn(
     texts, sequences, accessions = zip(*batch)
 
     # -------- TEXT TOKENIZATION --------
-    text_inputs = dataset.text_tokenizer.batch_encode_plus(
+    text_inputs = dataset.text_tokenizer(
         list(texts),
         truncation=True,
         max_length=dataset.text_max_length,
@@ -265,7 +266,7 @@ class TextSeqPairing_Dataset(Dataset):
     def caption_tokenizer(self, batch_captions: list) -> dict:
         
         # transform input text tokens
-        text_inputs = self.text_tokenizer.batch_encode_plus(
+        text_inputs = self.text_tokenizer(
                             batch_captions,
                             truncation=True,
                             max_length=self.text_max_length,
@@ -352,7 +353,7 @@ class MaskTextSeqPairing_Dataset(Dataset):
     def caption_tokenizer(self, batch_captions: list) -> dict:
 
         # transform input text tokens
-        text_inputs = self.text_tokenizer.batch_encode_plus(
+        text_inputs = self.text_tokenizer(
                             batch_captions,
                             truncation=True,
                             max_length=self.text_max_length,
@@ -540,7 +541,7 @@ class Pfam_TextSeqPairing_Dataset(Dataset):
     def caption_tokenizer(self, batch_captions: list) -> dict:
 
         # transform input text tokens
-        text_inputs = self.text_tokenizer.batch_encode_plus(
+        text_inputs = self.text_tokenizer(
                             batch_captions,
                             truncation=True,
                             max_length=self.text_max_length,
@@ -683,7 +684,8 @@ class Pfam_TextSeqPairing_Dataset(Dataset):
             accession_id,
             Xp_pfam,
             Xt_pfam,
-            bool_pfam_vector
+            bool_pfam_vector,
+            queried_pfam_label
         )
 
     def __getitem__(self, idx: torch.Tensor) -> (
@@ -724,8 +726,9 @@ class Pfam_TextSeqPairing_Dataset(Dataset):
             bool_pfam_vector = ['False']
             pfam_text_data = {'input_ids': []}
             pfam_protein_data = {'protein_sequence_tokens': []}
+            queried_pfam_label = ''
         else:
-            pfam_accession_id, pfam_protein_sequence, pfam_text_captions, bool_pfam_vector = self.extraction_pfam_samples(pfam_labels=pfam_labels)
+            pfam_accession_id, pfam_protein_sequence, pfam_text_captions, bool_pfam_vector, queried_pfam_label = self.extraction_pfam_samples(pfam_labels=pfam_labels)
 
         # stochastic annotation dropout for Pfam text too
         pfam_text_captions = apply_field_dropout(pfam_text_captions)
@@ -741,6 +744,12 @@ class Pfam_TextSeqPairing_Dataset(Dataset):
         # BERT attended over the padding and z_t carried a caption-length
         # signal. Captions stay padded to a fixed length -- the default collate
         # needs uniform shapes -- and the mask handles the pads.
+        # False-negative keys, appended AFTER index 10 so collate_dynamic_text's
+        # positional field constants keep pointing at the caption tensors.
+        # The family key is the family this item was actually paired on
+        # (extraction_pfam_samples' random choice), which is exactly what
+        # L_PFC treats as the positive -- so it needs no set logic over
+        # Swiss-Prot's multi-family label list.
         return (
                 text_data['input_ids'],
                 protein_data['protein_sequence_tokens'],
@@ -752,7 +761,10 @@ class Pfam_TextSeqPairing_Dataset(Dataset):
                 pfam_protein_data['protein_sequence_tokens_masked'],
                 bool_pfam_vector,
                 text_data['attention_mask'],
-                pfam_text_data['attention_mask']
+                pfam_text_data['attention_mask'],
+                seq_hash64(protein_sequence),
+                seq_hash64(pfam_protein_sequence),
+                seq_hash64(queried_pfam_label)
         )
 
 
@@ -845,6 +857,35 @@ class Default_DataModule(LightningDataModule):
 # Caption tensors in a Pfam_TextSeqPairing_Dataset item: Swiss-Prot input_ids,
 # its MLM-masked copy, Pfam input_ids, its masked copy, and the two attention
 # masks. Every item is tokenized to text_max_length; see collate_dynamic_text.
+# ---------------------------------------------------------------------------
+# False-negative keys.
+#
+# A contrastive batch contains pairs that are NOT negatives of each other but
+# are scored as such: the same protein under a different caption (Swiss-Prot
+# has ~8.9 caption variants per accession), and two items drawn on the same
+# Pfam family (~25 per row at M = 49,152). The homolog pair (i, i +- N) is
+# already handled by an index rule; these two need a key comparison instead.
+#
+# The keys are 64-bit digests so no global code table has to be built or kept
+# in sync across ranks -- equality is all the mask needs, and blake2b is stable
+# across processes and runs (unlike hash()). Collision probability over the
+# 19,471 families and ~31 M accessions is ~1e-11.
+#
+# NO_KEY marks a row that must never match anything: the 'nan'-label rows,
+# whose Pfam side is an empty string, would otherwise all look identical.
+# seq_hash64 matches jobs/loss_trace/trace_stage1_loss.py so the diagnostic and
+# the trainer agree on what counts as a duplicate.
+NO_KEY = 0
+
+
+def seq_hash64(s: str) -> int:
+    """Signed 64-bit digest of a string, for equality tests only."""
+    if not s:
+        return NO_KEY
+    return int.from_bytes(hashlib.blake2b(s.encode(), digest_size=8).digest(),
+                          "big", signed=True)
+
+
 _PFAM_ITEM_TEXT_FIELDS = (0, 2, 4, 6, 9, 10)
 _PFAM_ITEM_ATTN_FIELDS = (9, 10)
 DYNAMIC_PAD_MULTIPLE = 64

@@ -45,6 +45,7 @@ src/biom3/
   benchmarks/       # Stage 3 training/generation benchmarks + plotting
   viz/              # 3D structure rendering, sequence analysis, unmasking-order plots
   app/              # Streamlit web app (installed via the `app` extra)
+  cli/              # `biom3 <command>` dispatcher: registry.py (command table), dispatch.py
 configs/            # JSON configs for inference, per-stage training, RL, splits, and jobs
   inference/        #   Inference configs; models/ holds shared bases (uses _base_configs composition)
   stage1_training/  #   Stage 1 training; models/ + machines/ bases
@@ -54,6 +55,9 @@ configs/            # JSON configs for inference, per-stage training, RL, splits
   split/ weights/   #   Split specs and named weight sets
   benchmark/ jobs/  #   Benchmark and job-template configs
 scripts/            # Bash wrappers (embedding, training, generation, RL, cloud, sync)
+docker/             # Dockerfiles (cuda, cpu, xpu, xpu-oneapi), build/push/run wrappers, entrypoint
+cloud/              # Mithril job runner (run.mithril.yaml) and its README
+requirements/       # pip requirement sets per machine and per image
 demos/              # End-to-end demos (dbio dataset building, SH3 embedding pipeline)
 data/databases/     # Symlinked reference databases (gitignored, see docs/setup/setup_databases.md)
 tests/              # pytest suite (conftest.py, per-stage tests, test data in tests/_data/)
@@ -65,6 +69,9 @@ jobs/               # HPC job submission scripts
 ## Entry points
 
 Defined in `pyproject.toml`. See [docs/CLI_reference.md](docs/CLI_reference.md) for argument tables.
+
+Unified command:
+- `biom3 <command>` → `biom3.cli:main`. Dispatches a curated subset of the entry points below (e.g. `biom3 embed`, `biom3 generate`, `biom3 finetune`, `biom3 train stage3`) with unchanged arguments. Commands are declared in `src/biom3/cli/registry.py`; the `biom3_*` names stay available. The dispatcher must not modify `sys.argv`, since Lightning re-executes it to launch worker processes.
 
 Inference:
 - `biom3_PenCL_inference` → `biom3.Stage1.__main__:run_PenCL_inference`

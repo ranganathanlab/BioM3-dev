@@ -116,14 +116,19 @@ def check_available_memory():
 # training used, so it is the default and the in-distribution choice.
 # 'dynamic' pads only to the longest caption in the batch.
 #
-# The two are not interchangeable at inference. TextEncoder.forward calls the
-# BERT model with input_ids alone and no attention_mask, so the encoder attends
-# over every [PAD] and the padding length changes z_t. Under 'dynamic' the batch
-# composition therefore leaks into z_t: the same caption embeds differently
-# depending on what it was batched with, so results are not reproducible unless
-# batch ordering is fixed. Measured on the 179,679-row SH3 corpus, a max-padded
-# run and a dynamic-padded bank agree at z_t cosine median 0.982 with no row
-# reaching parity, while z_p is bit-identical.
+# Without the caption attention mask the two are not interchangeable at
+# inference: BERT then attends over every [PAD], so the padding length changes
+# z_t. Under 'dynamic' the batch composition therefore leaks into z_t: the same
+# caption embeds differently depending on what it was batched with, so results
+# are not reproducible unless batch ordering is fixed. Measured on the
+# 179,679-row SH3 corpus, a max-padded run and a dynamic-padded bank agree at
+# z_t cosine median 0.982 with no row reaching parity, while z_p is
+# bit-identical.
+#
+# With the mask (collate_fn(include_mask=True), inference's
+# --text_attention_mask) the pads are ignored and both modes give the same z_t
+# to float rounding, so 'dynamic' is safe and faster. Whether to pass the mask
+# is a property of the weights: it must match how they were trained.
 TEXT_PADDING_MODES = {"max_padding": "max_length", "dynamic": "longest"}
 DEFAULT_TEXT_PADDING = "max_padding"
 
@@ -204,8 +209,11 @@ def _warn_long_sequences_once(sequences, accessions, seq_max_length):
 def collate_fn(
         batch, 
         dataset: BatchedTextSeqPairingDataset, 
-        include_raw=False
+        include_raw=False,
+        include_mask=False,
 ):
+    """Tokenize a batch. With include_mask the caption attention mask is
+    appended as the last element of the returned tuple."""
     texts, sequences, accessions = zip(*batch)
 
     # -------- TEXT TOKENIZATION --------
@@ -229,7 +237,7 @@ def collate_fn(
         batch_tokens = batch_tokens[:, : dataset.seq_max_length]
 
     if include_raw:
-        return (
+        out = (
             text_inputs["input_ids"], 
             batch_tokens,
             list(texts),        # raw text captions
@@ -237,7 +245,10 @@ def collate_fn(
             list(accessions),   # accession IDs
         )
     else:
-        return text_inputs["input_ids"], batch_tokens
+        out = (text_inputs["input_ids"], batch_tokens)
+    if include_mask:
+        out += (text_inputs["attention_mask"],)
+    return out
 
 ########################################
 # Dataset iterator with masking tokens #

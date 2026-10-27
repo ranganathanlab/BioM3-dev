@@ -7,6 +7,8 @@ intermediate file paths automatically from --output_dir and --prefix.
 
 With --generate the terminal step is ProteoScribe sampling instead of HDF5
 compilation, giving CSV → Stage 1 → Stage 2 → Stage 3 generated sequences.
+With --skip_facilitator Stage 2 is replaced by the identity map, z_c = z_t, for
+weight sets that have no Facilitator.
 Running this entrypoint under a launcher (scripts/launchers/*_{single,multi}node.sh)
 shards the work: Stage 1 splits batches across ranks and merges on rank 0,
 Stage 2 and the HDF5 compile run on rank 0 alone, and the Stage 3 sampler
@@ -19,6 +21,8 @@ import sys
 from argparse import Namespace
 from datetime import datetime
 
+import torch
+
 from biom3.backend.device import setup_logger
 from biom3.backend.device import DEVICE_CHOICES, resolve_device
 from biom3.core.distributed import barrier, is_main_process
@@ -29,6 +33,11 @@ from biom3.core.run_utils import (
     setup_file_logging,
     teardown_file_logging,
     write_manifest,
+)
+from biom3.core.weight_sets import (
+    check_normalize_zc,
+    check_text_attention_mask,
+    merge_weight_set,
 )
 
 logger = setup_logger(__name__)
@@ -65,8 +74,15 @@ def parse_arguments(args):
         help="Path to Stage 1 JSON config (stage1_config_PenCL_inference.json)"
     )
     parser.add_argument(
-        "--facilitator_config", type=str, required=True,
-        help="Path to Stage 2 JSON config (stage2_config_Facilitator_sample.json)"
+        "--facilitator_config", type=str, default=None,
+        help="Path to Stage 2 JSON config (stage2_config_Facilitator_sample.json); "
+             "required unless --skip_facilitator is given"
+    )
+    parser.add_argument(
+        "--skip_facilitator", action="store_true", default=False,
+        help="Replace Stage 2 with the identity map: z_c is written as a copy "
+             "of z_t, and the remaining steps run as usual. Facilitator config "
+             "and weights are not needed"
     )
     parser.add_argument(
         "--prefix", type=str, required=True,
@@ -97,7 +113,16 @@ def parse_arguments(args):
         choices=["max_padding", "dynamic"],
         help="Stage 1 caption padding. 'max_padding' pads to text_max_length, "
              "matching training; 'dynamic' pads to the batch's longest caption, "
-             "which makes z_t depend on batch composition (default: max_padding)"
+             "which makes z_t depend on batch composition unless "
+             "--text_attention_mask is given (default: max_padding)"
+    )
+    parser.add_argument(
+        "--text_attention_mask", action="store_true",
+        help="Stage 1: pass the caption attention mask to BERT. Set it to match "
+             "how the PenCL weights were trained; off (default) for run1_base. "
+             "A weight set can record that as "
+             "pencl_trained_with_text_attention_mask, and the pipeline warns "
+             "when this flag disagrees with it"
     )
     parser.add_argument(
         "--no_amp", action="store_true",
@@ -157,17 +182,26 @@ def parse_arguments(args):
         help="Stage 3 unmasking order (passed through to the sampler)"
     )
     parser.add_argument(
+        "--normalize_zc", action="store_true",
+        help="Stage 3: scale each conditioning vector to unit length (passed through "
+             "to the sampler; for a ProteoScribe trained with --normalize_zc True)"
+    )
+    parser.add_argument(
         "--num_replicas", type=optional_positive_int, default=None,
         help="Stage 3 sequences per prompt (passed through to the sampler; "
              "unset defers to the sampler's config-then-default resolution)"
     )
     parsed = parser.parse_args(args)
 
-    weight_keys = ["pencl_weights", "facilitator_weights"]
+    if not parsed.skip_facilitator and not parsed.facilitator_config:
+        parser.error("--facilitator_config is required unless --skip_facilitator is given")
+
+    weight_keys = ["pencl_weights"]
+    if not parsed.skip_facilitator:
+        weight_keys.append("facilitator_weights")
     if parsed.generate:
         weight_keys.append("proteoscribe_weights")
 
-    from biom3.core.weight_sets import merge_weight_set
     merge_weight_set(parsed, parsed.weight_set, keys=tuple(weight_keys))
     missing = [k for k in weight_keys if not getattr(parsed, k)]
     if missing:
@@ -197,7 +231,16 @@ def _build_stage3_argv(args, input_path, output_path):
         argv += ["--unmasking_order", args.unmasking_order]
     if args.num_replicas is not None:
         argv += ["--num_replicas", str(args.num_replicas)]
+    if args.normalize_zc:
+        argv.append("--normalize_zc")
     return argv
+
+
+def _write_identity_zc(pencl_output, facilitator_output):
+    """Stand in for Stage 2 with the identity map: z_c is a copy of z_t."""
+    embedding_dataset = torch.load(pencl_output, weights_only=False)
+    embedding_dataset["z_c"] = embedding_dataset["z_t"].clone()
+    torch.save(embedding_dataset, facilitator_output)
 
 
 def main(args):
@@ -226,16 +269,31 @@ def main(args):
         start_time = datetime.now()
         logger.info("=" * 60)
         logger.info(
-            "Embedding pipeline (Stage 1 -> Stage 2 -> %s)",
+            "Embedding pipeline (Stage 1 -> %s -> %s)",
+            "identity" if args.skip_facilitator else "Stage 2",
             "Stage 3" if args.generate else "HDF5",
         )
         logger.info("biom3 version: %s (git: %s)", get_biom3_version(), get_git_hash())
         logger.info("Command:     %s", " ".join(sys.argv))
         logger.info("=" * 60)
 
+        mask_summary, mask_warning = check_text_attention_mask(
+            args.weight_set, args.pencl_weights, args.text_attention_mask)
+        zc_warning = []
+        if args.generate:
+            zc_summary, zc_warning = check_normalize_zc(
+                args.weight_set, args.proteoscribe_weights, args.normalize_zc)
+        if is_main_process():
+            logger.info(mask_summary)
+            if args.generate:
+                logger.info(zc_summary)
+            for line in mask_warning + zc_warning:
+                logger.warning(line)
+
         # Load config contents for manifest
         pencl_config_contents = load_json_config(args.pencl_config)
-        facilitator_config_contents = load_json_config(args.facilitator_config)
+        if not args.skip_facilitator:
+            facilitator_config_contents = load_json_config(args.facilitator_config)
 
         # Intermediate file paths
         pencl_output = os.path.join(args.output_dir, f"{args.prefix}.PenCL_emb.pt")
@@ -258,6 +316,7 @@ def main(args):
             "--cross_comparison_sample_limit", str(args.cross_comparison_sample_limit),
             "--text_padding", args.text_padding,
         ] + (["--no_amp"] if args.no_amp else [])
+          + (["--text_attention_mask"] if args.text_attention_mask else [])
           + (["--float32_matmul_precision", args.float32_matmul_precision]
              if args.float32_matmul_precision else []))
         run_stage1(stage1_args, _setup_logging=False)
@@ -269,7 +328,12 @@ def main(args):
         # --- Stage 2: Facilitator sampling ---
         # Main rank only: the Facilitator is a small MLP, so there is nothing to gain
         # from sharding it, and every rank writing the same file would race.
-        if is_main_process():
+        if args.skip_facilitator and is_main_process():
+            logger.info("=" * 60)
+            logger.info("Stage 2 skipped: z_c is a copy of z_t")
+            logger.info("=" * 60)
+            _write_identity_zc(pencl_output, facilitator_output)
+        elif is_main_process():
             logger.info("=" * 60)
             logger.info("Stage 2: Facilitator sampling")
             logger.info("=" * 60)
@@ -318,6 +382,8 @@ def main(args):
 
         logger.info("Pipeline complete. Output: %s", final_output)
         logger.info("=" * 60)
+        for line in mask_warning + zc_warning:
+            logger.warning(line)
 
         # Write manifest
         elapsed = datetime.now() - start_time
@@ -329,14 +395,13 @@ def main(args):
             "input_data_path": os.path.abspath(args.input_data_path),
             "weight_set": os.path.abspath(args.weight_set) if args.weight_set else None,
             "pencl_weights": os.path.abspath(args.pencl_weights),
-            "facilitator_weights": os.path.abspath(args.facilitator_weights),
             "pencl_config": os.path.abspath(args.pencl_config),
-            "facilitator_config": os.path.abspath(args.facilitator_config),
         }
-        config_contents = {
-            "pencl": pencl_config_contents,
-            "facilitator": facilitator_config_contents,
-        }
+        config_contents = {"pencl": pencl_config_contents}
+        if not args.skip_facilitator:
+            resolved_paths["facilitator_weights"] = os.path.abspath(args.facilitator_weights)
+            resolved_paths["facilitator_config"] = os.path.abspath(args.facilitator_config)
+            config_contents["facilitator"] = facilitator_config_contents
         if args.generate:
             outputs["generated_output"] = os.path.abspath(generated_output)
             resolved_paths["proteoscribe_weights"] = os.path.abspath(args.proteoscribe_weights)

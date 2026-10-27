@@ -118,6 +118,11 @@ def pad_ends(
     padded_seqs = seqs + ['-']*pad_need
     return padded_seqs
 
+# Index of '-' in create_num_seqs' vocabulary: the token pad_ends appends to the
+# tail of a sequence. It is not the mask token of the diffusion process, which is 0.
+PAD_TOKEN_ID = 23
+
+
 def create_num_seqs(seq_list: list) -> list:
     """
     Convert a protein sequence from amino acid letters to numerical indices.
@@ -355,7 +360,7 @@ def encode_protein_sequence(sequence: str, image_size: int) -> list:
 
 def make_seq_caption_collate_fn(*, text_tokenizer, text_max_length, image_size,
                                 sequence_key="sequence", caption_key="caption",
-                                include_sequences=False):
+                                include_sequences=False, include_mask=False):
     """Build a collate fn mapping composed records to model-ready tensors.
 
     The returned callable takes a batch of ``{sequence_key: str, caption_key: str}``
@@ -368,7 +373,10 @@ def make_seq_caption_collate_fn(*, text_tokenizer, text_max_length, image_size,
     Returns ``(num_seqs [B, image_size**2] float32, input_ids [B, text_max_length])``,
     the batch contract expected by :class:`PL_ProtARDM_Finetune`.
 
-    With ``include_sequences=True`` a third element is appended: the raw
+    With ``include_mask=True`` the caption attention mask follows
+    ``input_ids``, for PenCL weights trained with the mask.
+
+    With ``include_sequences=True`` a last element is appended: the raw
     sequence strings, verbatim from the record. z_p-blended finetuning uses
     them to key its precomputed z_p lookup.
     """
@@ -387,13 +395,15 @@ def make_seq_caption_collate_fn(*, text_tokenizer, text_max_length, image_size,
             max_length=text_max_length,
             padding="max_length",
             return_tensors="pt",
-            return_attention_mask=False,
+            return_attention_mask=include_mask,
             return_token_type_ids=False,
         )
+        out = (num_seqs, text_inputs["input_ids"])
+        if include_mask:
+            out += (text_inputs["attention_mask"],)
         if include_sequences:
-            return (num_seqs, text_inputs["input_ids"],
-                    [sample[sequence_key] for sample in batch])
-        return num_seqs, text_inputs["input_ids"]
+            out += ([sample[sequence_key] for sample in batch],)
+        return out
 
     return _collate
 

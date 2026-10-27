@@ -260,6 +260,83 @@ class TestBuildTextToZcEmbedder:
         assert all(not p.requires_grad for p in embedder.parameters())
 
 
+# --------------------------- no-Facilitator path ----------------------------
+
+class TestWithoutFacilitator:
+    """``use_facilitator=False``: z_c is the raw z_t.
+
+    A ProteoScribe pretrained on raw z_t has never seen facilitated vectors, so
+    the front-end has to be able to stop after the projection head.
+    """
+
+    def test_no_facilitator_is_built(self, args):
+        stage1, _ = args
+        embedder = TextToZcEmbedder(stage1, None)
+        assert embedder.facilitator is None
+        assert not any(k.startswith("facilitator.")
+                       for k in embedder.state_dict())
+
+    def test_forward_returns_z_t(self, args):
+        """The bypass output equals the projection head's own output."""
+        stage1, _ = args
+        torch.manual_seed(7)
+        embedder = TextToZcEmbedder(stage1, None).eval()
+        tokens = torch.randint(0, VOCAB, (3, 1, SEQ_LEN))
+
+        with torch.no_grad():
+            got = embedder(tokens)
+            want = embedder.text_projection(embedder.text_encoder(tokens))
+
+        assert got.shape == (3, PROJ_DIM)
+        assert torch.equal(got, want)
+
+    def test_builds_without_facilitator_weights(self, tmp_path, args, reference):
+        stage1, _ = args
+        pencl = _write_pencl_ckpt(tmp_path / "pencl.ckpt", reference)
+
+        embedder = build_text_to_zc_embedder(
+            stage1, None, str(pencl), None, use_facilitator=False)
+
+        assert embedder.facilitator is None
+        assert not embedder.training
+        assert all(not p.requires_grad for p in embedder.parameters())
+
+    def test_text_branch_still_required(self, tmp_path, args, reference):
+        """Bypassing the Facilitator must not weaken the PenCL load."""
+        stage1, _ = args
+        pencl = _write_pencl_ckpt(tmp_path / "pencl.ckpt", reference,
+                                  include_text=False)
+
+        with pytest.raises(RuntimeError, match="did not populate"):
+            build_text_to_zc_embedder(
+                stage1, None, str(pencl), None, use_facilitator=False)
+
+    def test_null_pencl_still_raises(self, args):
+        stage1, _ = args
+        with pytest.raises(ValueError, match="required for finetuning"):
+            build_text_to_zc_embedder(
+                stage1, None, None, None, use_facilitator=False)
+
+    def test_facilitator_weights_with_bypass_raise(self, tmp_path, args, reference):
+        """Given both, refuse rather than silently ignore the weights."""
+        stage1, _ = args
+        pencl = _write_pencl_ckpt(tmp_path / "pencl.ckpt", reference)
+        fac = _write_facilitator_ckpt(tmp_path / "fac.ckpt", reference)
+
+        with pytest.raises(ValueError, match="would not be used"):
+            build_text_to_zc_embedder(
+                stage1, None, str(pencl), str(fac), use_facilitator=False)
+
+    def test_missing_facilitator_weights_names_the_flag(self, tmp_path, args,
+                                                        reference):
+        """The default path's error points at the way out."""
+        stage1, stage2 = args
+        pencl = _write_pencl_ckpt(tmp_path / "pencl.ckpt", reference)
+
+        with pytest.raises(ValueError, match="--use_facilitator False"):
+            build_text_to_zc_embedder(stage1, stage2, str(pencl), None)
+
+
 # ------------------- shipped run1_base checkpoint (opt-in) -------------------
 
 _RUN1_PENCL = "weights/PenCL/run1_base_pencl.ckpt"

@@ -1,20 +1,19 @@
 # Pip constraints for the oneAPI-based Aurora container (docker/Dockerfile.xpu-oneapi).
 #
 # Counterpart to constraints-xpu.txt, which pins the Ubuntu-based image at torch
-# 2.8.0+xpu. This image pins 2.10.0+xpu instead, because its base is oneAPI
-# 2025.3 and torch 2.8's runtime dependencies are 2025.1.1. Mixing them breaks
-# whichever half loses the LD_LIBRARY_PATH race:
+# 2.8.0+xpu. This image pins 2.14.1+xpu instead, because its base is oneAPI
+# 2026.1 and a wheel's runtime dependencies have to be the base's release.
+# Mixing releases breaks whichever half loses the LD_LIBRARY_PATH race:
 #   torch    -> libur_loader.so.0: version `LIBUR_LOADER_0.11' not found
 #   mpi4py   -> libmpifort.so.12: undefined symbol: MPIR_F_MPI_BUFFER_AUTOMATIC
 #
-# 2.10.0+xpu depends on the 2025.3 runtime, matching both the base image and
-# Aurora's frameworks/2025.3.1 (which runs a source-built torch 2.10.0a0).
+# 2.14.1+xpu depends on the 2026.1 runtime, matching both the base image and
+# Aurora's frameworks/2026.1.0 (which runs a source-built torch 2.13.0a0).
 #
-# No intel-extension-for-pytorch: there is no public 2.10 build, and the only
-# thing that required it was a gate in the lightning fork's XPUAccelerator,
-# removed upstream in addison-nm/lightning#1.
+# No intel-extension-for-pytorch: the only thing that required it was a gate in
+# the lightning fork's XPUAccelerator, removed upstream in addison-nm/lightning#1.
 #
 # Constraints only bound versions; they never install anything on their own.
 
-torch==2.10.0+xpu
-torchvision==0.25.0+xpu
+torch==2.14.1+xpu
+torchvision==0.29.1+xpu

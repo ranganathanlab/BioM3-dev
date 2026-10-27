@@ -60,10 +60,10 @@ Some tests depend on pretrained weight files that are too large to commit to git
 |------|-------|-------|
 | `LLMs/esm2_t33_650M_UR50D.pt` | 1 | `test_stage1_run_PenCL_inference` |
 | `PenCL/BioM3_PenCL_epoch20.bin` | 1 | `test_stage1_run_PenCL_inference` |
-| `PenCL/PenCL_V09152023_last.ckpt` | 1 | `test_stage1_run_PenCL_inference` (checkpoint loading variant) |
+| `PenCL/run1_base_pencl.ckpt` | 1 | `test_stage1_run_PenCL_inference` (checkpoint loading variant), `test_finetune_embedder` |
 | `Facilitator/BioM3_Facilitator_epoch20.bin` | 2 | `test_stage2_run_Facilitator_sample` |
 | `ProteoScribe/BioM3_ProteoScribe_pfam_epoch20_v1.bin` | 3 | `test_model_load_from_bin`, `test_stage3_run_ProteoScribe_sample`, `test_stage3_run_PL_training` |
 | `ProteoScribe/BioM3_ProteoScribe_pfam_epoch20_v1.renamed.bin` | 3 | `test_model_load_from_bin`, `test_stage3_run_ProteoScribe_sample` |
 | `ProteoScribe/epoch200_full.ckpt/single_model.pth` | 3 | `test_model_load_from_checkpoint_file` |
 
-All of these files are available in the shared weights directory and can be populated by running `link_weights.sh` as described above. Tests that do not depend on these files — including the key-correction tests using committed dummy weights (see `docs/bug_reports/axial_positional_embedding_keys.md`) — will always run.
+All of these files are available in the shared weights directory and can be populated by running `link_weights.sh` as described above. They are also published as a bundle: `biom3_fetch_weights --test_weights -o weights` fetches the same set (about 11 GB). Tests that do not depend on these files — including the key-correction tests using committed dummy weights (see `docs/bug_reports/axial_positional_embedding_keys.md`) — will always run.

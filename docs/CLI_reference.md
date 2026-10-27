@@ -75,7 +75,7 @@ Produces joint protein/text embeddings (`z_p`, `z_t`) from a CSV of (sequence, p
 |---|---|---|
 | `-i`, `--input_data_path` | str | Path to input CSV (sequences + prompts). Pass `None` to use the built-in test dataset. |
 | `-c`, `--config_path` | str | Path to JSON config (e.g. `configs/inference/stage1_PenCL.json`). |
-| `-m`, `--model_path` | str | Path to pretrained PenCL weights (`.bin`) or Lightning checkpoint (`.ckpt`). |
+| `-m`, `--model_path` | str | Path to pretrained PenCL weights: a raw state dict or a Lightning checkpoint. The format is read from the file, not its extension, and the run stops if any model parameter is not found in it. |
 | `-o`, `--output_path` | str | Path to write output embeddings (`.pt`). |
 
 #### Optional arguments
@@ -85,7 +85,9 @@ Produces joint protein/text embeddings (`z_p`, `z_t`) from a CSV of (sequence, p
 | `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected backend: CUDA, then XPU, else CPU. |
 | `--batch_size` | int | 32 | Inference batch size. |
 | `--num_workers` | int | 0 | DataLoader worker count. |
-| `--load_from_checkpoint` | flag | False | Force loading `model_path` as a Lightning `.ckpt` (otherwise inferred from extension). |
+| `--load_from_checkpoint` | flag | False | Kept for compatibility; it no longer changes how weights load. With it, or with a `.ckpt` path, the network class follows the config's `model_type`. |
+| `--text_padding` | str | `max_padding` | Caption padding: `max_padding` pads to `text_max_length`, as training does; `dynamic` pads to the batch's longest caption. Without `--text_attention_mask`, `dynamic` makes `z_t` depend on batch composition. |
+| `--text_attention_mask` | flag | False | Pass the caption attention mask to BERT so `[PAD]` tokens are ignored. Set it to match how the weights were trained: on for weights trained with the mask (Stage 1 pfam training since 2026-09-09), off for `run1_base`. A mismatch runs without error but gives a different `z_t` (mean cosine 0.87 to the matched setting, measured on `run1_base`). With it on, `--text_padding dynamic` gives the same `z_t` and is faster. |
 | `--no_amp` | flag | False | Disable autocast and run the forward pass in fp32. Autocast (bf16 on xpu, fp16 on cuda) is on by default. bf16 rounding depends on tensor shape, so results vary slightly with batch size; pair `--no_amp` with `--float32_matmul_precision highest` when comparing runs. |
 | `--cross_comparison_sample_limit` | int | 0 | Samples used for the O(n²) cross-comparison metrics (dot-product probabilities, homology matrix). `0` = skip entirely (default), `-1` = all, positive = that many. Each metric allocates an n×n fp32 matrix (~25 GB at n=80k), so `-1` is only safe on small datasets. **Print-only** — saved embeddings are unaffected. |
 
@@ -168,6 +170,8 @@ Generates protein sequences from facilitated embeddings via diffusion sampling. 
 | `--pre_unmask` | flag | False | Start diffusion from a partially-unmasked state. Requires `--pre_unmask_config`. |
 | `--pre_unmask_config` | str | None | Path to JSON describing the pre-unmask strategy. |
 | `--alpha` | float | 0.0 | Weight on `z_p` when conditioning: `y = alpha * z_p + (1 - alpha) * z_c`. `0` (default) is text-only. Anything above 0 requires `z_p` in `--input_path`, which Stage 1 emits and Stage 2 preserves. Only meaningful for a model trained with a matching blend — see [Conditioning blend](#conditioning-blend-alpha). |
+| `--normalize_zc` | flag | False | Scale each conditioning vector to unit length, after any `--alpha` blend. Use it for a model trained with `--normalize_zc True`, and only for such a model. Also settable as `normalize_zc` in the JSON config. |
+| `--weight_set` | str | None | Weight-set JSON naming `--model_path` as its `proteoscribe_weights`. Its record of how ProteoScribe was trained, `proteoscribe_trained_with_normalized_zc`, is checked against `--normalize_zc`; a disagreement logs a loud warning at the start and the end, and the run follows the flag. It does not replace `--model_path`. |
 
 #### Optional arguments — output
 
@@ -219,9 +223,9 @@ Runs `biom3_PenCL_inference` → `biom3_Facilitator_sample` → HDF5 compilation
 | `-i`, `--input_data_path` | str | Path to input CSV (sequences + prompts). |
 | `-o`, `--output_dir` | str | Directory for all output files. |
 | `--pencl_weights` | str | Path to PenCL weights or checkpoint. |
-| `--facilitator_weights` | str | Path to Facilitator weights or checkpoint. |
+| `--facilitator_weights` | str | Path to Facilitator weights or checkpoint. Not needed with `--skip_facilitator`. |
 | `--pencl_config` | str | Path to Stage 1 JSON config. |
-| `--facilitator_config` | str | Path to Stage 2 JSON config. |
+| `--facilitator_config` | str | Path to Stage 2 JSON config. Not needed with `--skip_facilitator`. |
 | `--prefix` | str | Filename prefix for intermediate and final output files, the run log (`<prefix>.run.log`), and the manifest (`<prefix>.build_manifest.json`). |
 
 #### Optional arguments
@@ -231,11 +235,14 @@ Runs `biom3_PenCL_inference` → `biom3_Facilitator_sample` → HDF5 compilation
 | `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected backend: CUDA, then XPU, else CPU. |
 | `--batch_size` | int | 256 | Stage 1 batch size. |
 | `--num_workers` | int | 0 | Stage 1 DataLoader worker count. |
+| `--text_padding` | str | `max_padding` | Forwarded to Stage 1. |
+| `--text_attention_mask` | flag | False | Forwarded to Stage 1: pass the caption attention mask to BERT. Must match how the PenCL weights were trained; off for `run1_base`. A weight set can record that as `pencl_trained_with_text_attention_mask` (true or false); the flag still decides what the run does, and the pipeline logs a loud warning when the two disagree. |
 | `--no_amp` | flag | False | Forwarded to Stage 1: run the forward pass in fp32 instead of autocast. |
 | `--float32_matmul_precision` | str | config (`high`) | Forwarded to Stage 1. Pair `highest` with `--no_amp` for a deterministic fp32 forward pass. |
 | `--cross_comparison_sample_limit` | int | 0 | Forwarded to Stage 1. `0` = skip the O(n²) cross-comparison metrics (default), `-1` = all, positive = that many. **Print-only**. |
 | `--mmd_sample_limit` | int | 1000 | Stage 2 MMD sample cap. |
 | `--dataset_key` | str | `MMD_data` | HDF5 group name for the compiled output. |
+| `--skip_facilitator` | flag | False | Replace Stage 2 with the identity map, for weight sets with no Facilitator: `z_c` is written to `<prefix>.Facilitator_emb.pt` as a copy of `z_t`, and the HDF5 compile (or Stage 3 with `--generate`) runs on it as usual. |
 
 #### Optional arguments — Stage 3 generation
 
@@ -250,6 +257,7 @@ With `--generate`, the terminal step is [`biom3_ProteoScribe_sample`](#biom3_pro
 | `--no_fasta` | flag | False | Skip the FASTA output, which is on by default here. |
 | `--token_strategy` | str | None | Forwarded to the sampler. |
 | `--unmasking_order` | str | None | Forwarded to the sampler. |
+| `--normalize_zc` | flag | False | Forwarded to the sampler: scale each conditioning vector to unit length. For a ProteoScribe trained with `--normalize_zc True`. Checked against the weight set's `proteoscribe_trained_with_normalized_zc`, with a loud warning on disagreement. |
 | `--num_replicas` | int | None | Forwarded to the sampler. Unset defers to the Stage 3 config, else 5. |
 
 ---
@@ -372,6 +380,7 @@ The argparser is the largest in the project (70+ flags across `get_args`, `get_m
 | `--secondary_data_paths` | str (n+) | None | One or more secondary HDF5 dataset paths. |
 | `--training_strategy` | str | `auto` | One of `auto`, `primary_only`, `combine`. |
 | `--start_secondary` | str | `'False'` | `'True'`/`'False'`. Phase transition: load primary weights, then train on combined data. |
+| `--normalize_zc` | str | `'False'` | `'True'`/`'False'`. Scale the conditioning vector to unit length before the model sees it, after any `z_p` blend, in training and validation. Generation has to match: pass `--normalize_zc` to `biom3_ProteoScribe_sample` for a model trained this way. Shared with `biom3_finetune_stage3`. |
 | `--train_alpha` | str | `zc` | Conditioning blend during training. See [Conditioning blend](#conditioning-blend-alpha). |
 | `--eval_alpha` | str | `spread` | Conditioning blend for validation batches. |
 | `--zp_path` | str | None | Facilitator `.pt` holding `z_p` row-aligned with `--primary_data_path`. Required when `--train_alpha` puts weight on `z_p`. |
@@ -383,14 +392,16 @@ The argparser is the largest in the project (70+ flags across `get_args`, `get_m
 | `--batch_size` | int | 16 | Per-device batch size. |
 | `--lr` | float | 3e-4 | Base learning rate. |
 | `--scale_learning_rate` | str | `'True'` | Scale LR by world size. |
+| `--loss_positions` | str | `all` | Unsampled positions whose loss drives the gradients: `all`, or `non_pad` for the sequence without its tail padding. `loss_all`, `loss_non_pad` and `loss_pad` are logged either way. See [Loss terms and padding](misc/stage3_training.md#loss-terms-and-padding). |
 | `--precision` | str | `no` | One of `no`, `fp16`, `bf16`, `32`. |
 | `--device` | str | `auto` | One of `auto`, `cpu`, `cuda`, `xpu`. `auto` = the detected GPU backend (CUDA, then XPU); it never falls back to CPU, so pass `cpu` to train on CPU. The run also stops early if `--devices_per_node` exceeds the devices this process can see. |
 | `--devices_per_node` | int | 1 | GPUs/tiles per node. (Deprecated alias: `--gpu_devices`.) |
 | `--num_nodes` | int | 1 | Nodes. |
-| `--distributed_strategy` | str | `deepspeed_zero2` | One of `deepspeed_zero2` (DeepSpeed ZeRO-2 + CPU offload, sharded checkpoint dir) or `ddp` (plain DDP with `static_graph=True`, single-file checkpoint). Distinct from `--training_strategy` which selects `primary_only` vs `combine` *data* mixing. |
+| `--distributed_strategy` | str | `deepspeed_zero2` | One of `deepspeed_zero2` (DeepSpeed ZeRO-2 + CPU offload, sharded checkpoint dir) or `ddp` (plain DDP with `static_graph=True`, single-file checkpoint; with one rank, a single-device strategy and no process group). Distinct from `--training_strategy` which selects `primary_only` vs `combine` *data* mixing. |
 | `--resume_from_checkpoint` | str | `'None'` | Path to a Lightning `.ckpt` to resume from. |
 | `--pretrained_weights` | str | `'None'` | Path to raw weights to load before training. |
-| `--finetune` | str | `'False'` | `'True'`/`'False'`. Enable finetuning mode. |
+| `--weight_set` | str | None | Weight-set JSON (e.g. `configs/weights/run1_base.json`). Its `proteoscribe_weights` fill `--pretrained_weights` when that is not given, and its record of how ProteoScribe was trained is checked against `--normalize_zc`. Shared with `biom3_finetune_stage3`. Given on the command line, it also replaces a path set in the JSON config, since the command line outranks the config; a path given on the command line always wins. |
+| `--finetune` | str | `'False'` | `'True'`/`'False'`. Enable finetuning mode. Needs `--pretrained_weights` or `--resume_from_checkpoint`; without either the run stops instead of training from random weights. |
 | `--finetune_last_n_blocks` | int | -2 | -1 = all, 0 = none, N = last N blocks. |
 | `--finetune_last_n_layers` | int | -2 | Same convention as blocks. |
 | `--finetune_output_layers` | str | `"True"` | Whether to unfreeze the transformer output layers. |
@@ -461,7 +472,7 @@ See [stage3_training.md](misc/stage3_training.md) for resumption, secondary-data
 
 Finetunes ProteoScribe on a **JSONL dataset of cleaned records** rather than on precomputed `z_c` in HDF5 (which is what `biom3_train_stage3` consumes). For each record, a `--record_schema` composes a caption from the record's fields, which is embedded to `z_c` on-device through a frozen text→`z_c` front-end (PenCL text branch + Facilitator). The caption is re-composed every epoch, so `z_c` cannot be precomputed — hence the separate entrypoint.
 
-This entrypoint is always finetuning: it loads pretrained ProteoScribe weights or resumes from a Lightning checkpoint, and freezes all but a chosen subset of the transformer. Trainer setup, callbacks, checkpointing, freezing, and arg coercion are reused from `run_PL_training`, so the shared arguments in [`biom3_train_stage3`](#biom3_train_stage3--stage-3-proteoscribe-training-and-finetuning) apply here too — including `--dry_run` and the wandb handling described below.
+This entrypoint is always finetuning: it loads pretrained ProteoScribe weights or resumes from a Lightning checkpoint (it stops if given neither), and freezes all but a chosen subset of the transformer. Trainer setup, callbacks, checkpointing, freezing, and arg coercion are reused from `run_PL_training`, so the shared arguments in [`biom3_train_stage3`](#biom3_train_stage3--stage-3-proteoscribe-training-and-finetuning) apply here too — including `--dry_run` and the wandb handling described below.
 
 #### Key arguments — data and captions
 
@@ -483,6 +494,8 @@ This entrypoint is always finetuning: it loads pretrained ProteoScribe weights o
 | `--stage2_config_path` | `None` | Facilitator config |
 | `--pencl_weights` | `None` | PenCL weights |
 | `--facilitator_weights` | `None` | Facilitator weights |
+| `--weight_set` | `None` | Weight-set JSON (e.g. `configs/weights/run1_base.json`). Fills `--pencl_weights`, `--facilitator_weights` and `--pretrained_weights` when they are not given, and its records of how PenCL and ProteoScribe were trained are checked against `--text_attention_mask` and `--normalize_zc`. Given on the command line, it also replaces a path set in the JSON config, since the command line outranks the config; a path given on the command line always wins. |
+| `--text_attention_mask` | `False` | Pass the caption attention mask to BERT in the frozen front-end. Set it to match how the PenCL weights were trained; `False` for `run1_base`. When it disagrees with the weight set's `pencl_trained_with_text_attention_mask`, the run follows the flag and logs a loud warning at the start and the end |
 | `--zp_batch_size` | `64` | Batch size for `z_p` precomputation |
 
 #### Key arguments — LoRA and conditioning

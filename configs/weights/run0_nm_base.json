@@ -1,5 +1,7 @@
 {
     "pencl_weights": "./weights/PenCL/PenCL_V09152023_last.ckpt",
+    "pencl_trained_with_text_attention_mask": false,
     "facilitator_weights": "./weights/Facilitator/Facilitator_MMD15.ckpt/last.ckpt",
-    "proteoscribe_weights": "./weights/ProteoScribe/BioM3_ProteoScribe_pfam_epoch20_v1.renamed.bin"
+    "proteoscribe_weights": "./weights/ProteoScribe/BioM3_ProteoScribe_pfam_epoch20_v1.renamed.bin",
+    "proteoscribe_trained_with_normalized_zc": false
 }

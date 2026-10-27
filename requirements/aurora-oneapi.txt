@@ -3,20 +3,19 @@
 #
 # Counterpart to aurora-container.txt, which targets the Ubuntu-based image.
 # The two differ only where the oneAPI version forces it: this image is built on
-# oneAPI 2025.3 with torch 2.10.0+xpu, so dpctl can be 0.21.1 — the version
-# Aurora's frameworks/2025.3.1 itself runs — rather than the 0.19.0 that torch
-# 2.8's 2025.1.1 runtime constrains the other image to.
+# oneAPI 2026.1 with torch 2.14.1+xpu, so dpctl is 0.22.1 — which requires the
+# 2026 runtime — rather than the 0.19.0 that torch 2.8's 2025.1.1 runtime
+# constrains the other image to.
 #
 # Not listed here, installed separately in the Dockerfile:
 #   * torch / torchvision  -> from the +xpu wheel index (native torch.xpu)
 #   * pytorch-lightning    -> the addison-nm/lightning fork (Intel-GPU support)
 #   * nvidia-ml-py         -> CUDA-only; not applicable on Intel GPUs
-#   * intel-extension-for-pytorch -> no public 2.10 build, and not needed: the
-#                                    lightning fork's gate on it was removed in
-#                                    addison-nm/lightning#1
+#   * intel-extension-for-pytorch -> not needed: the lightning fork's gate on it
+#                                    was removed in addison-nm/lightning#1
 
 numpy==2.2.6
-dpctl==0.21.1
+dpctl==0.22.1
 tensorboardX==2.6.4
 axial-positional-embedding==0.3.12
 linear-attention-transformer==0.19.1

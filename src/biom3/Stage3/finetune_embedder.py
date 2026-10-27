@@ -1,10 +1,17 @@
 """Frozen text -> z_c embedding front-end for Stage 3 finetuning.
 
-ProteoScribe is conditioned on z_c, the facilitated text embedding. Only the
-*text* branch of PenCL is needed to produce it:
+ProteoScribe is conditioned on z_c. Only the *text* branch of PenCL is needed
+to produce it:
 
     z_t  = text_projection(text_encoder(input_ids))      # Stage 1 (PenCL)
     z_c  = facilitator(z_t)                               # Stage 2 (Facilitator)
+
+The Facilitator is optional. A ProteoScribe pretrained on raw z_t has never
+seen facilitated vectors, so conditioning it on them at finetuning time would
+feed it a different distribution from the one it was trained on. For those
+weights, build the embedder with ``use_facilitator=False`` and the second line
+above becomes ``z_c = z_t``. Which one is correct is fixed by how ProteoScribe
+was pretrained; it is not a free hyperparameter.
 
 The protein branch (ESM-2) participates only in Stage 1's contrastive loss and
 is never used for conditioning, so it is not instantiated here. This keeps the
@@ -29,9 +36,17 @@ PROTEIN_BRANCH_PREFIXES = ("protein_encoder.", "protein_projection.")
 class TextToZcEmbedder(nn.Module):
     """Maps tokenized text (BioBERT input_ids) to ProteoScribe's z_c condition.
 
-    Holds only PenCL's text branch (``text_encoder`` + ``text_projection``) and
-    the Stage 2 ``facilitator``. Attribute names match PenCL so its checkpoint
-    loads with ``strict=False`` (the protein-branch keys are ignored).
+    Holds only PenCL's text branch (``text_encoder`` + ``text_projection``) and,
+    unless ``stage2_args`` is None, the Stage 2 ``facilitator``. Attribute names
+    match PenCL so its checkpoint loads with ``strict=False`` (the protein-branch
+    keys are ignored). With ``stage2_args=None`` the Facilitator is not built at
+    all and ``forward`` returns the raw z_t.
+
+    ``stage2_args`` has no default: which vector conditions ProteoScribe is fixed
+    by how it was pretrained, and nothing here can check that, so a caller has to
+    say ``None`` deliberately rather than reach the raw-z_t front-end by omission.
+    The default lives on :func:`build_text_to_zc_embedder` instead, where it
+    preserves the historical behaviour.
     """
 
     def __init__(self, stage1_args, stage2_args):
@@ -41,17 +56,26 @@ class TextToZcEmbedder(nn.Module):
             embedding_dim=stage1_args.text_encoder_embedding,
             args=stage1_args,
         )
-        self.facilitator = stage1_mod.Facilitator(
-            in_dim=stage2_args.emb_dim,
-            hid_dim=stage2_args.hid_dim,
-            out_dim=stage2_args.emb_dim,
-            dropout=stage2_args.dropout,
-        )
+        if stage2_args is None:
+            self.facilitator = None
+        else:
+            self.facilitator = stage1_mod.Facilitator(
+                in_dim=stage2_args.emb_dim,
+                hid_dim=stage2_args.hid_dim,
+                out_dim=stage2_args.emb_dim,
+                dropout=stage2_args.dropout,
+            )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        z_t = self.text_projection(self.text_encoder(input_ids))
-        z_c = self.facilitator(z_t)
-        return z_c
+    def forward(self, input_ids: torch.Tensor,
+                attention_mask: torch.Tensor = None) -> torch.Tensor:
+        if attention_mask is None:
+            hidden = self.text_encoder(input_ids)
+        else:
+            hidden = self.text_encoder(input_ids, attention_mask=attention_mask)
+        z_t = self.text_projection(hidden)
+        if self.facilitator is None:
+            return z_t
+        return self.facilitator(z_t)
 
 
 def _load_frozen_weights(module, weights_path, required_prefixes, label, device=None):
@@ -100,8 +124,9 @@ def build_text_to_zc_embedder(
         pencl_weights: str,
         facilitator_weights: str,
         device=None,
+        use_facilitator: bool = True,
     ) -> TextToZcEmbedder:
-    """Build the frozen text->z_c embedder and load PenCL + Facilitator weights.
+    """Build the frozen text->z_c embedder and load PenCL (+ Facilitator) weights.
 
     Both paths accept a raw state dict (``.bin``/``.pt``), a Lightning
     ``.ckpt``, a checkpoint directory, or a DeepSpeed ZeRO shard directory. The
@@ -109,19 +134,30 @@ def build_text_to_zc_embedder(
     parameter to be populated; the Facilitator load requires all of its own. The
     returned module is frozen and in eval mode so its embeddings are
     deterministic and match inference.
+
+    ``use_facilitator=False`` builds the z_c = z_t front-end for a ProteoScribe
+    pretrained on raw z_t: no Facilitator is constructed and none is loaded, so
+    ``stage2_args`` and ``facilitator_weights`` are not needed and are refused
+    if given, rather than being silently ignored.
     """
     if not pencl_weights:
         raise ValueError(
             "--pencl_weights is required for finetuning: without it the frozen "
             "text->z_c embedder runs on a randomly initialised projection head."
         )
-    if not facilitator_weights:
+    if use_facilitator and not facilitator_weights:
         raise ValueError(
             "--facilitator_weights is required for finetuning: without it z_c is "
-            "produced by a randomly initialised Facilitator."
+            "produced by a randomly initialised Facilitator. Pass "
+            "--use_facilitator False if ProteoScribe was pretrained on raw z_t."
+        )
+    if not use_facilitator and facilitator_weights:
+        raise ValueError(
+            "--facilitator_weights was given with --use_facilitator False; the "
+            "Facilitator would not be used. Drop one of the two."
         )
 
-    embedder = TextToZcEmbedder(stage1_args, stage2_args)
+    embedder = TextToZcEmbedder(stage1_args, stage2_args if use_facilitator else None)
 
     logger.info("Loading PenCL text-branch weights from: %s", pencl_weights)
     _load_frozen_weights(
@@ -131,13 +167,16 @@ def build_text_to_zc_embedder(
         device=device,
     )
 
-    logger.info("Loading Facilitator weights from: %s", facilitator_weights)
-    _load_frozen_weights(
-        embedder.facilitator, facilitator_weights,
-        required_prefixes=("",),
-        label="Facilitator",
-        device=device,
-    )
+    if use_facilitator:
+        logger.info("Loading Facilitator weights from: %s", facilitator_weights)
+        _load_frozen_weights(
+            embedder.facilitator, facilitator_weights,
+            required_prefixes=("",),
+            label="Facilitator",
+            device=device,
+        )
+    else:
+        logger.info("No Facilitator: conditioning ProteoScribe on the raw z_t.")
 
     for p in embedder.parameters():
         p.requires_grad = False

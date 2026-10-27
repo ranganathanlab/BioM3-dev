@@ -9,30 +9,33 @@
 #   GPUs idle. That image carries OpenMPI + pip-installed oneCCL, while Aurora's
 #   launcher is Intel MPI, and Lightning's MPIEnvironment asks mpi4py for the
 #   rank -- which requires an mpi4py built against an ABI-compatible MPI.
-#   intel/oneapi-hpckit supplies Intel MPI and oneCCL, which is why ALCF's own
-#   container recipe uses it (_misc/sample_script.sh, mirrored from
+#   Intel's oneAPI images supply Intel MPI and oneCCL, which is why ALCF's own
+#   container recipe uses one (_misc/sample_script.sh, mirrored from
 #   https://docs.alcf.anl.gov/aurora/containers/containers/).
 #
-# VERSIONS ARE ALIGNED ON ONEAPI 2025.3
+# VERSIONS ARE ALIGNED ON ONEAPI 2026.1
 #   Everything here is pinned to the base's oneAPI version, which is also what
-#   Aurora's frameworks/2025.3.1 runs. This image first tried torch 2.8.0+xpu
-#   (as Dockerfile.xpu pins) and that does not work: 2.8's runtime deps are
-#   oneAPI 2025.1.1, so with the 2025.3 base present the loader resolves
-#   per-library and one side always breaks -- torch failing on
+#   Aurora's frameworks/2026.1.0 runs. Each torch +xpu wheel depends on one
+#   oneAPI runtime, and it has to be the base's: with two present the loader
+#   resolves per-library and one side always breaks -- torch failing on
 #   LIBUR_LOADER_0.11, or mpi4py on MPIR_F_MPI_BUFFER_AUTOMATIC, depending on
-#   LD_LIBRARY_PATH order. No ordering satisfies both.
+#   LD_LIBRARY_PATH order. No ordering satisfies both. (Seen with torch
+#   2.8.0+xpu, whose runtime is 2025.1.1, on a 2025.3 base.)
 #
-#   torch 2.10.0+xpu depends on 2025.3, dpctl 0.21.1 requires >=2025.3 (and is
-#   Aurora's version), and pip's duplicate Intel MPI / oneCCL are removed so the
-#   base's are the only ones present. IPEX is dropped: there is no public 2.10
-#   build, and the fork's gate on it was removed in addison-nm/lightning#1.
+#   torch 2.14.1+xpu depends on 2026.1, dpctl 0.22.1 requires >=2026.0, and
+#   pip's own Intel MPI / oneCCL resolve to the base's versions. IPEX is not
+#   installed: the fork's gate on it was removed in addison-nm/lightning#1.
+#
+#   The base is intel/oneapi, not intel/oneapi-hpckit: the 2026 releases are
+#   published only under the former. The tag is pinned so a rebuild cannot move
+#   the oneAPI version out from under the pins below.
 #
 # amd64 ONLY, same as Dockerfile.xpu: Intel GPU torch wheels are x86_64-only.
 #
 # Build:  docker/build.sh --variant xpu-oneapi --platform linux/amd64
 # Run:    scripts/aurora/apptainer_mpi_run.sh (host mpiexec, one container/rank)
 
-FROM intel/oneapi-hpckit
+FROM intel/oneapi:2026.1.0-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -59,14 +62,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -V && python3 -m pip --version && python3 -m venv -h >/dev/null
 
-# Intel GPU user-space runtime. oneapi-hpckit provides the oneAPI runtimes but
-# not the Level-Zero GPU *driver*, which must match the host kernel driver.
+# Intel GPU user-space runtime. The Level-Zero GPU *driver* must match the host
+# kernel driver.
 # The unversioned libze_loader.so, which oneCCL dlopen()s, already exists in this
 # base (unlike the Ubuntu base of Dockerfile.xpu); the symlink below is a no-op
 # kept so the requirement stays visible if the base changes.
-# The base already has Intel's GPU repo configured (with its own keyring), so
-# adding a second source entry for it fails with a Signed-By conflict -- install
-# straight from what is there.
+# The base already has an Intel graphics apt source configured (in 2026.1,
+# ppa:kobuk-team/intel-graphics), so install straight from what is there rather
+# than adding a second source entry.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libze1 libze-intel-gpu1 intel-opencl-icd clinfo \
     && rm -rf /var/lib/apt/lists/* \
@@ -101,13 +104,13 @@ RUN . /opt/intel/oneapi/setvars.sh --force \
     && MPICC=mpiicx pip install --no-binary=mpi4py --no-build-isolation mpi4py \
     && python -c "from mpi4py import MPI; print('mpi4py', MPI.Get_library_version())"
 
-# torch 2.10.0+xpu, NOT the 2.8.0 that Dockerfile.xpu pins. 2.8's runtime deps
-# are oneAPI 2025.1.1 while this base is 2025.3; with both present the loader
-# picks per-library and one side always breaks:
+# torch 2.14.1+xpu, NOT the 2.8.0 that Dockerfile.xpu pins. A wheel whose
+# runtime deps are another oneAPI release does not work on this base; with both
+# present the loader picks per-library and one side always breaks:
 #   torch  -> libur_loader.so.0: version `LIBUR_LOADER_0.11' not found
 #   mpi4py -> libmpifort.so.12: undefined symbol: MPIR_F_MPI_BUFFER_AUTOMATIC
-# 2.10.0+xpu depends on 2025.3, matching the base and Aurora's frameworks.
-RUN pip install torch==2.10.0+xpu torchvision==0.25.0+xpu \
+# 2.14.1+xpu depends on 2026.1, matching the base and Aurora's frameworks.
+RUN pip install torch==2.14.1+xpu torchvision==0.29.1+xpu \
         --index-url https://download.pytorch.org/whl/xpu
 
 # Custom lightning fork with Intel-GPU support, pinned to a commit: an unpinned
@@ -117,10 +120,9 @@ ARG LIGHTNING_REF=5116b36e81d6be8d4c466179f3a47dd528d95c0f
 RUN pip install --no-build-isolation \
         "git+https://github.com/addison-nm/lightning.git@${LIGHTNING_REF}"
 
-# No IPEX is installed here: there is no public 2.10 build (Aurora's 2.10.10 is
-# an ALCF source build). Assert the fork's XPUAccelerator constructs without it,
-# because a return of its old intel_extension_for_pytorch gate would strand the
-# accelerator on every torch this image can actually install.
+# No IPEX is installed here. Assert the fork's XPUAccelerator constructs without
+# it, because a return of its old intel_extension_for_pytorch gate would strand
+# the accelerator.
 RUN python -c "\
 from lightning.pytorch.accelerators.xpu import XPUAccelerator; \
 from lightning.fabric.accelerators.xpu import num_xpu_devices; \
@@ -129,11 +131,13 @@ print('XPUAccelerator constructs without IPEX; fabric devices:', num_xpu_devices
 
 # pip installs its own impi-rt and oneCCL alongside the base's, as transitive
 # dependencies of torch. That is fine here and deliberately left alone: with
-# torch 2.10 both resolve to 2021.17, matching the base, so the loader cannot mix
-# incompatible versions across one library's dependencies. It is only a problem
-# when the versions differ -- with torch 2.8 pip brought 2021.15 and mpi4py then
-# failed on MPIR_F_MPI_BUFFER_AUTOMATIC, which is part of why this image pins
-# 2.10. Uninstalling them does not stick; pip restores them on the next install.
+# torch 2.14.1 they resolve to impi-rt 2021.18.1 and oneCCL 2022.1.1, the base's
+# 2021.18 and 2022.1, so the loader cannot mix incompatible versions across one
+# library's dependencies. It is only a problem when the versions differ -- with
+# torch 2.8 on a 2025.3 base pip brought 2021.15 and mpi4py then failed on
+# MPIR_F_MPI_BUFFER_AUTOMATIC, which is why torch is pinned to the base's oneAPI
+# release. Uninstalling them does not stick; pip restores them on the next
+# install.
 
 WORKDIR /app
 COPY requirements/ /app/requirements/

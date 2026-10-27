@@ -10,6 +10,7 @@
     - [Embedding and generation workflow](#embedding-and-generation-workflow-1)
   - [Case 3: Using BioM3 on HPC environments through Apptainer](#case-3-using-biom3-on-hpc-environments-through-apptainer)
     - [Embedding and generation workflow](#embedding-and-generation-workflow-2)
+  - [Troubleshooting](#troubleshooting)
 - [Detailed Usage Instructions](#detailed-usage-instructions)
   - [Finetuning ProteoScribe](#finetuning-proteoscribe)
     - [On a single CUDA device, from a code checkout](#on-a-single-cuda-device-from-a-code-checkout)
@@ -150,7 +151,7 @@ BioM3 Docker images are published at `ghcr.io/natural-machine/biom3`. There are 
 Tags are patterned `<variant>-<commit>`, where the commit specifies the particular state of the BioM3 code used to create the image. As new versions of BioM3 are released, these images will be updated. To pull an image onto your workstation, specify a particular tag and run:
 
 ```bash
-docker pull ghcr.io/natural-machine/biom3:cuda-2bf065b
+docker pull ghcr.io/natural-machine/biom3:cuda-e34af20
 ```
 
 The image carries the code, standard configuration files under `configs/`, and test
@@ -164,7 +165,7 @@ mkdir -p weights data outputs
 Now, fetch the current set of model weights with the following. We first point to the image that we previously pulled. Docker runs the specified biom3 command inside of this container and stops the container when the command finished (`--rm`). Docker typically runs as root, so we specify our user profile explicitly (`-u "$(id -u):$(id -g)"`). Finally, we mount the local weights directory that we created above, which Docker will have access to with the path to the right of the colon (`"$PWD/weights:/app/weights"`).
 
 ```bash
-export BIOM3_IMAGE=ghcr.io/natural-machine/biom3:cuda-2bf065b
+export BIOM3_IMAGE=ghcr.io/natural-machine/biom3:cuda-e34af20
 docker run --rm -u "$(id -u):$(id -g)" -v "$PWD/weights:/app/weights" \
     $BIOM3_IMAGE biom3_fetch_weights run1_base -o /app/weights
 
@@ -184,7 +185,7 @@ The mount points matter here. The container's working directory is `/app`, and b
 
 ```bash
 # Name the image once, so the commands below can refer to it.
-export BIOM3_IMAGE=ghcr.io/natural-machine/biom3:cuda-2bf065b
+export BIOM3_IMAGE=ghcr.io/natural-machine/biom3:cuda-e34af20
 
 # Make sure directories exist before mounting them, otherwise Docker creates missing ones as root.
 mkdir -p data outputs
@@ -249,10 +250,10 @@ module load apptainer
 export APPTAINER_CACHEDIR=/flare/NLDesignProtein/$USER/.apptainer/cache
 export APPTAINER_TMPDIR=/tmp/$USER/apptainer-tmp
 mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
-apptainer build biom3_xpu-oneapi-2bf065b.sif docker://ghcr.io/natural-machine/biom3:xpu-oneapi-2bf065b
+apptainer build biom3_xpu-oneapi-abd9941.sif docker://ghcr.io/natural-machine/biom3:xpu-oneapi-abd9941
 ```
 
-This command should produce a file `biom3_xpu-oneapi-2bf065b.sif` under the current directory. Whereas the Docker commands above point to a specified Docker image, the following commands instead point to the .sif image.
+This command should produce a file `biom3_xpu-oneapi-abd9941.sif` under the current directory. Whereas the Docker commands above point to a specified Docker image, the following commands instead point to the .sif image.
 Importantly, running `apptainer exec` on Aurora requires that one be on a compute node. As such, request an interactive job or submit a pbs job to run the following. Also note that one must load apptainer.
 
 ```bash
@@ -260,7 +261,14 @@ Importantly, running `apptainer exec` on Aurora requires that one be on a comput
 cd /path/to/BioM3-dev
 module load apptainer
 
-export BIOM3_IMAGE="biom3_xpu-oneapi-2bf065b.sif"
+# Aurora compute nodes need the following for internet access
+# Add this chunk of code to your .bash_profile if desired. 
+export HTTP_PROXY=http://proxy.alcf.anl.gov:3128
+export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+
+export BIOM3_IMAGE="biom3_xpu-oneapi-abd9941.sif"
 mkdir -p weights
 apptainer exec --bind "$PWD/weights:/app/weights" \
     "$BIOM3_IMAGE" biom3_fetch_weights run1_base -o /app/weights
@@ -289,7 +297,7 @@ Refer to that section for conceptual details. The equivalent commands, run using
 cd /path/to/BioM3-dev
 
 module load apptainer
-export BIOM3_IMAGE="$PWD/biom3_xpu-oneapi-2bf065b.sif"
+export BIOM3_IMAGE="$PWD/biom3_xpu-oneapi-abd9941.sif"
 
 # The wrapper mounts data/ and outputs/ by name, so they have to exist.
 mkdir -p data outputs
@@ -316,6 +324,32 @@ scripts/aurora/apptainer_run.sh biom3_ProteoScribe_sample \
     -m weights/ProteoScribe/run1_base_proteoscribe.bin \
     -o outputs/demo/generation/generated.pt --fasta  --num_replicas 5
 ```
+
+### Troubleshooting
+
+**Aurora internet connection errors**
+
+On Aurora, compute nodes do not have network access by default, so one needs to export the following variables for interactive or submitted jobs:
+
+```bash
+export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"
+export HTTPS_PROXY="http://proxy.alcf.anl.gov:3128"
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+```
+
+For convenience, one may include the following in `.bash_profile`, which will automatically enable connections on compute nodes for *interactive jobs*:
+
+```bash
+# proxy settings
+if [[ -n "${PBS_JOBID:-}" ]]; then
+    export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"
+    export HTTPS_PROXY="http://proxy.alcf.anl.gov:3128"
+    export http_proxy="http://proxy.alcf.anl.gov:3128"
+    export https_proxy="http://proxy.alcf.anl.gov:3128"
+fi
+```
+
 
 ## Detailed Usage Instructions
 
@@ -453,7 +487,7 @@ Follow the steps detailed above in the Quickstart instructions to ensure Docker 
 Fetch the weights as described in the Quickstart. Then fetch the GFP dataset and embed it, using the same commands as above run through the container:
 
 ```bash
-export BIOM3_IMAGE=ghcr.io/natural-machine/biom3:cuda-2bf065b
+export BIOM3_IMAGE=ghcr.io/natural-machine/biom3:cuda-e34af20
 mkdir -p weights data outputs
 
 docker run --rm -u "$(id -u):$(id -g)" -v "$PWD/data:/app/data" \
@@ -599,7 +633,7 @@ With the dataset fetched as described above, embed it (Stages 1 and 2) once, on 
 ```bash
 # On an Aurora compute node, from the root of the checkout
 module load apptainer
-export BIOM3_IMAGE="$PWD/biom3_xpu-oneapi-2bf065b.sif"
+export BIOM3_IMAGE="$PWD/biom3_xpu-oneapi-abd9941.sif"
 
 scripts/aurora/apptainer_run.sh biom3_embedding_pipeline \
     -i data/gfp_sample_dataset.csv \
@@ -615,7 +649,7 @@ On a compute node, either interactively or through a PBS script, run the followi
 
 ```bash
 module load apptainer
-export BIOM3_IMAGE="$PWD/biom3_xpu-oneapi-2bf065b.sif"
+export BIOM3_IMAGE="$PWD/biom3_xpu-oneapi-abd9941.sif"
 
 NGPU_PER_NODE=1 NGPU_TOTAL=1 BIOM3_RANK_SOURCE=mpi \
 scripts/aurora/apptainer_mpi_run.sh biom3_train_stage3 \
@@ -650,12 +684,12 @@ Through a PBS script, request N nodes and run the following command. Submit it f
 
 cd ${PBS_O_WORKDIR}
 module load apptainer
-export BIOM3_IMAGE="$PWD/biom3_xpu-oneapi-2bf065b.sif"
+export BIOM3_IMAGE="$PWD/biom3_xpu-oneapi-abd9941.sif"
 
 NUM_NODES=$(wc -l < ${PBS_NODEFILE})
 export NGPU_PER_NODE=12 NGPU_TOTAL=$((NUM_NODES * 12))
 export BIOM3_RANK_SOURCE=mpi
-export BIOM3_FABRIC_DIR=/opt/cray/libfabric/1.22.0/lib64 BIOM3_FI_PROVIDER=cxi
+export BIOM3_FABRIC_DIR=/opt/cray/libfabric/2.3.1/lib64 BIOM3_FI_PROVIDER=cxi
 
 scripts/aurora/apptainer_mpi_run.sh biom3_train_stage3 \
     --config_path configs/stage3_training/finetune_v1.json \

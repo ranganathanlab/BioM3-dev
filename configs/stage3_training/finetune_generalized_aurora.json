@@ -65,6 +65,7 @@
 
   "stage1_config_path": "configs/inference/stage1_PenCL.json",
   "stage2_config_path": "configs/inference/stage2_Facilitator.json",
+  "weight_set": "configs/weights/run1_base.json",
   "pencl_weights": "weights/PenCL/run1_base_pencl.bin",
   "facilitator_weights": "weights/Facilitator/run1_base_facilitator.bin",
 

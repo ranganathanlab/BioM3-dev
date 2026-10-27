@@ -73,7 +73,7 @@
 # With the bind below, two nodes instead run ~3.8x the tcp throughput.
 # Driving CXI needs HPE's Cray libfabric bound in. Intel MPI's own bundled
 # libfabric has no cxi provider, in the image or under /opt/aurora:
-#   BIOM3_FABRIC_DIR=/opt/cray/libfabric/1.22.0/lib64 \
+#   BIOM3_FABRIC_DIR=/opt/cray/libfabric/2.3.1/lib64 \
 #   BIOM3_FI_PROVIDER=cxi \
 #   scripts/aurora/apptainer_mpi_run.sh ...
 # See setup_aurora_container.md.
@@ -123,7 +123,7 @@ BINDS=("/flare" "${MOUNTS[@]}" "${PMIX}:/hostlib/libpmix.so.2" "/usr/lib64:/host
 # It must be the directory *containing* libfabric.so.1, and it must be HPE's
 # Cray build -- Intel MPI's own bundled libfabric ships efa/psm3/rxm/tcp/verbs
 # and no cxi, on Aurora as elsewhere:
-#   BIOM3_FABRIC_DIR=/opt/cray/libfabric/1.22.0/lib64 BIOM3_FI_PROVIDER=cxi
+#   BIOM3_FABRIC_DIR=/opt/cray/libfabric/2.3.1/lib64 BIOM3_FI_PROVIDER=cxi
 # In that build cxi is compiled in rather than a loadable plugin, which is why
 # FI_PROVIDER_PATH is empty on bare metal and only set below when a prov/
 # directory actually exists.
@@ -289,7 +289,12 @@ SETVARS=""
 # Appended, never prepended, and inside the container so the image's own
 # LD_LIBRARY_PATH survives. /hostevent exists only so PMIx can find the host's
 # libevent; nothing else should resolve there in preference to the image.
-HOSTEVENT='export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/hostevent"
+# The image's system library directory goes in front of it for that reason:
+# LD_LIBRARY_PATH is searched before the default directories, so without it the
+# host's copy of anything in /usr/lib64 wins -- including the Level-Zero GPU
+# driver, which leaves torch.xpu.device_count() at 0 when the image's
+# Level-Zero loader is a different version from the host's.
+HOSTEVENT='export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/lib/x86_64-linux-gnu:/hostevent"
 '
 
 # Prepended, unlike /hostevent: the whole point is for the host libfabric to win

@@ -322,6 +322,53 @@ def log_prob_of_unsampled_locations(
     log_prob_unsampled = ((token_mask == 0)*1 * log_prob)
     return log_prob_unsampled.sum(1)
 
+def unsampled_loss_terms(
+        log_prob: torch.Tensor,
+        token_mask: torch.Tensor,
+        real_tokens: torch.Tensor,
+        pad_token_id: int
+    ) -> dict:
+    """
+    Split the loss over unsampled positions into sequence and padding terms.
+
+    Every unsampled position is one of two kinds, by its true token: padding,
+    the pad tokens that fill the tail of a sequence up to the model's fixed
+    length, or non-pad, the <START>, residue and <END> tokens of the sequence
+    itself. Padding is a property of the target. It is unrelated to the mask
+    token (0) that marks unsampled positions in the model's input, and a pad
+    that has already been sampled is context, not a target.
+
+    Each sequence's term is the mean negative log-probability over the
+    positions it actually contributes: its unsampled non-pad positions, or its
+    unsampled pad positions. That count is not a function of the diffusion time.
+    The unsampled positions are drawn from the whole fixed-length window, so how
+    many of them fall on the sequence depends on its length and on the draw, and
+    two sequences at the same diffusion time contribute different numbers. A
+    sequence that contributes none is left out of the batch average.
+
+    Args:
+        log_prob: Tensor of shape [batch_size, seq_length] containing log probabilities
+                 of the real tokens under the model's distribution
+        token_mask: The model's input tokens, shape [batch_size, seq_length],
+                    where 0 = position not yet sampled
+        real_tokens: Ground truth tokens, shape [batch_size, seq_length]
+        pad_token_id: Index of the pad token in the vocabulary
+
+    Returns:
+        dict: scalar losses under the keys 'non_pad' and 'pad'
+    """
+    unsampled = token_mask == 0
+    is_pad = real_tokens == pad_token_id
+    zeros = torch.zeros_like(log_prob)
+    terms = {}
+    for name, positions in (('non_pad', unsampled & ~is_pad), ('pad', unsampled & is_pad)):
+        count = positions.sum(1)
+        total = torch.where(positions, log_prob, zeros).sum(1)
+        per_sequence = -total / count.clamp(min=1)
+        contributes = count > 0
+        terms[name] = (per_sequence * contributes).sum() / contributes.sum().clamp(min=1)
+    return terms
+
 def weight_log_prob(
         log_prob_unsampled: torch.Tensor,
         idx: any,

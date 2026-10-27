@@ -62,6 +62,7 @@ from biom3.core.distributed import (
     init_distributed_if_launched,
     is_main_process,
 )
+from biom3.core.weight_sets import check_normalize_zc
 from biom3.Stage3.inpaint import (
     RUNTIME_TOKENS,
     build_template_state,
@@ -187,6 +188,16 @@ def parse_arguments(args):
                              "* z_c. 0.0 = text only (default, the established "
                              "behaviour); 1.0 = sequence only. Requires z_p in "
                              "the embedding file when > 0.")
+    parser.add_argument('--normalize_zc', action='store_true', default=False,
+                        help="scale each conditioning vector to unit length, after any "
+                             "alpha blend. Use it for a model trained with "
+                             "--normalize_zc True, and only for such a model. Also "
+                             "settable as normalize_zc in the JSON config.")
+    parser.add_argument('--weight_set', type=str, default=None,
+                        help="weight-set bundle JSON naming --model_path as its "
+                             "proteoscribe_weights. Its record of how ProteoScribe was "
+                             "trained is checked against --normalize_zc; it does not "
+                             "replace --model_path.")
     return parser.parse_args(args)
 
 
@@ -869,6 +880,11 @@ def blend_conditioning(embedding_dataset, alpha):
         )
     return alpha * z_p + (1.0 - alpha) * z_c
 
+def normalize_conditioning(z_c):
+    """Scale each conditioning vector to unit length, as training's normalize_zc does."""
+    return nn.functional.normalize(z_c.float(), dim=-1)
+
+
 def main(args, _setup_logging=True):
     args.device = resolve_device(args.device)
     # Parse arguments
@@ -1001,6 +1017,21 @@ def main(args, _setup_logging=True):
         alpha = getattr(config_args_parser, 'alpha', 0.0)
         z_c = blend_conditioning(embedding_dataset, alpha)
         logger.info("Conditioning blend: alpha=%.3f (0 = z_c, 1 = z_p)", alpha)
+        config_args.normalize_zc = bool(
+            getattr(config_args_parser, 'normalize_zc', False)
+            or getattr(config_args, 'normalize_zc', False))
+        if config_args.normalize_zc:
+            logger.info(
+                "Conditioning vectors scaled to unit length (mean length before: %.3f)",
+                z_c.float().norm(dim=-1).mean().item())
+            z_c = normalize_conditioning(z_c)
+        zc_summary, zc_warning = check_normalize_zc(
+            getattr(config_args_parser, 'weight_set', None),
+            config_args_parser.model_path, config_args.normalize_zc)
+        if rank == 0:
+            logger.info(zc_summary)
+            for line in zc_warning:
+                logger.warning(line)
 
         num_prompts = z_c.size(0) if isinstance(z_c, torch.Tensor) else len(z_c)
         animate_prompts_set = resolve_animate_prompts(
@@ -1139,6 +1170,7 @@ def main(args, _setup_logging=True):
                     "seed": seed,
                     "unmasking_order": config_args.unmasking_order,
                     "token_strategy": config_args.token_strategy,
+                    "normalize_zc": config_args.normalize_zc,
                     "total_sequences": num_prompts * config_args.num_replicas,
                     "output_file": os.path.abspath(args.output_path),
                 },
@@ -1149,6 +1181,8 @@ def main(args, _setup_logging=True):
                 },
                 config_contents=raw_config,
             )
+            for line in zc_warning:
+                logger.warning(line)
             logger.info("Done in %s", elapsed)
     finally:
         teardown_file_logging("biom3", file_handler)

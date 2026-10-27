@@ -63,8 +63,7 @@ from functools import partial
 
 import biom3.Stage1.preprocess as prep
 import biom3.Stage1.model as mod
-import biom3.Stage1.PL_wrapper as PL_wrap
-from biom3.core.io import load_and_prepare_model
+from biom3.Stage1.io import load_pencl_weights
 from biom3.core.helpers import load_json_config, convert_to_namespace
 from biom3.core.run_utils import (
     get_biom3_version,
@@ -104,8 +103,11 @@ def parse_arguments(args):
     parser.add_argument('--num_workers', type=int, default=0,
                         help="number of dataloading workers")
     parser.add_argument("--load_from_checkpoint", action="store_true",
-                        help="Flag to load model_path as a checkpoint. By default, " \
-                        "this action is inferred from a .ckpt extension of model_path")
+                        help="Kept for compatibility. Whether model_path is a raw "
+                             "state dict or a Lightning checkpoint is read from the "
+                             "file itself, so this no longer changes how weights "
+                             "load. With it, or with a .ckpt path, the network "
+                             "class follows the config's model_type.")
     parser.add_argument("--cross_comparison_sample_limit", type=int, default=0,
                         help="Number of samples used for the O(n^2) cross-comparison "
                              "metrics (dot-product probabilities, homology matrix). "
@@ -119,7 +121,16 @@ def parse_arguments(args):
                         help="caption padding. 'max_padding' pads to "
                              "text_max_length, matching training; 'dynamic' pads "
                              "to the batch's longest caption, which makes z_t "
-                             "depend on batch composition.")
+                             "depend on batch composition unless "
+                             "--text_attention_mask is given.")
+    parser.add_argument("--text_attention_mask", action="store_true",
+                        help="Pass the caption attention mask to BERT, so [PAD] "
+                             "tokens are ignored. Set it to match how the weights "
+                             "were trained: on for weights trained with the mask "
+                             "(Stage 1 pfam training since 2026-09-09), off "
+                             "(default) for run1_base, which was trained without "
+                             "it. With it on, z_t does not depend on padding and "
+                             "'--text_padding dynamic' is safe and faster.")
     parser.add_argument("--float32_matmul_precision", type=str, default=None,
                         choices=["highest", "high", "medium"],
                         help="fp32 matmul precision. 'high' (config default) enables "
@@ -161,13 +172,9 @@ def prepare_model_from_raw_weights(
     ) -> nn.Module:
     """Prepare a model from raw weight file (e.g. .bin or .pt)"""
     model = mod.pfam_PEN_CL(args=config_args)
-    model = load_and_prepare_model(
-        model, model_path, 
-        device=device, 
-        strict=False,  # NOTE: Avoids issue.
-        eval_mode=True,
-        attempt_correction=False,
-    )
+    load_pencl_weights(model, model_path, device=device)
+    model.to(device)
+    model.eval()
     return model
 
 
@@ -191,41 +198,9 @@ def prepare_model_from_checkpoint(
     model = model_class(args=config_args).to(device)
     model.eval()
 
-    # Decide on PL wrapper
-    PL_wrapper_options = {
-            'default': PL_wrap.PL_PEN_CL,
-            'masked': PL_wrap.mask_PL_PEN_CL,
-            'pfam': PL_wrap.pfam_PL_PEN_CL,
-            'pfam_ablated': PL_wrap.pfam_PL_PEN_CL
-    }
-    PL_wrapper_class = PL_wrapper_options.get(
-        config_args.model_type, PL_wrap.PL_PEN_CL
-    )
-    logger.info('PL wrapper class: %s', PL_wrapper_class)
-    
-    # Get PL model
-    PL_model = PL_wrapper_class(
-        args=config_args,
-        model=model,
-        text_tokenizer=model.text_encoder.tokenizer,
-        sequence_tokenizer=model.protein_encoder.alphabet
-    )
-    
     # Load pretrained weights
     logger.info('Loading weights from checkpoint...')
-    PL_model = PL_wrapper_class.load_from_checkpoint(
-        checkpoint_path=model_path,
-        map_location=device,
-        args=config_args,
-        model=model,
-        text_tokenizer=model.text_encoder.tokenizer,
-        sequence_tokenizer=model.protein_encoder.alphabet,
-        strict=False
-    )
-    # x = torch.load(model_path)
-    # print(x["state_dict"]["model.text_encoder.model.bert.embeddings.position_ids"])
-
-    model = PL_model.model
+    load_pencl_weights(model, model_path, device=device)
     return model
 
 
@@ -374,7 +349,9 @@ def main(args, _setup_logging=True):
         # The dataset is built from config_args, not from the CLI namespace, so the
         # padding mode has to be injected here to reach the collate_fn.
         config_args.text_padding = config_args_parser.text_padding
-        if config_args.text_padding != "max_padding":
+        text_attention_mask = config_args_parser.text_attention_mask
+        logger.info("caption attention mask: %s", "on" if text_attention_mask else "off")
+        if config_args.text_padding != "max_padding" and not text_attention_mask:
             logger.warning(
                 "text_padding=%s: BioM3 training used max_padding, so z_t is "
                 "off-distribution here, and under dynamic padding z_t also depends "
@@ -447,7 +424,8 @@ def main(args, _setup_logging=True):
             batch_sampler=my_batches,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=partial(prep.collate_fn, dataset=dataset, include_raw=True),
+            collate_fn=partial(prep.collate_fn, dataset=dataset, include_raw=True,
+                               include_mask=text_attention_mask),
         )
 
         # Run inference and store accession, text, protein sequence, z_t, and z_p
@@ -466,12 +444,16 @@ def main(args, _setup_logging=True):
 
         with torch.inference_mode():
             for item in tqdm.tqdm(loader, disable=not is_main):
-                x_t, x_p, texts, sequences, accessions = item
+                x_t, x_p, texts, sequences, accessions = item[:5]
                 x_t = x_t.to(device, non_blocking=True)
                 x_p = x_p.to(device, non_blocking=True)
+                x_t_mask = None
+                if text_attention_mask:
+                    x_t_mask = item[5].to(device, non_blocking=True)
 
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    outputs = model(x_t, x_p, compute_masked_logits=False)
+                    outputs = model(x_t, x_p, compute_masked_logits=False,
+                                    x_t_mask=x_t_mask)
                 z_t_list.append(outputs["text_joint_latent"].detach().float().cpu())
                 z_p_list.append(outputs["seq_joint_latent"].detach().float().cpu())
                 # z_t_list.append(outputs[0])

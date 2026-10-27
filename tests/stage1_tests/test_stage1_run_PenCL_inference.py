@@ -23,10 +23,10 @@ pytestmark = [pytest.mark.slow]
 ARGS_DIR = os.path.join(DATDIR, "entrypoint_args")
 OUTPUTS_DIR = os.path.join(TMPDIR, "outputs", "stage1_inference")
 
-# Required weights that need to be downloaded to run entrypoint test
+# Required weights that need to be downloaded to run entrypoint test. Each case
+# also needs the model its args file names with -m.
 REQUIRED_DOWNLOADS = [
     "weights/LLMs/esm2_t33_650M_UR50D.pt",
-    "weights/PenCL/BioM3_PenCL_epoch20.bin",
 ]
 
 
@@ -43,8 +43,11 @@ REQUIRED_DOWNLOADS = [
 def test_entrypoint(
         argstring_fpath, expect_error_context, device
     ):
+    # Parse the command line string
+    argstring = get_args(argstring_fpath)
+    model_path = parse_arguments(argstring).model_path
     # This test relies on the following downloaded weights. Check existence.
-    issues, skip_reason = check_downloads(REQUIRED_DOWNLOADS)
+    issues, skip_reason = check_downloads(REQUIRED_DOWNLOADS + [model_path])
     if issues:
         pytest.skip(reason=skip_reason)
     # Skip device if not available on machine
@@ -52,8 +55,6 @@ def test_entrypoint(
         pytest.skip(reason="device=cuda and cuda not available")
     elif device == "xpu" and not torch.xpu.is_available():
         pytest.skip(reason="device=xpu and xpu not available")
-    # Parse the command line string
-    argstring = get_args(argstring_fpath)
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
     # Run entrypoint, manually adding device to the argstring.
     with expect_error_context:

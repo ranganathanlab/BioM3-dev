@@ -27,7 +27,7 @@ to run at `docker run` time. Built per architecture:
 | `Dockerfile.cuda` | The NVIDIA image: `nvidia/cuda:12.9-base` → py3.12 → torch 2.8 (cu129) → BioM3 (`pip install -e .[app]`). Two-stage: the toolchain lives in a throwaway builder, and the runtime starts from `base` rather than `devel` because the torch wheel already ships every CUDA library it opens. |
 | `Dockerfile.cpu` | The slim CPU-only **inference** image: `ubuntu:24.04` → py3.12 → torch 2.8 (cpu) → BioM3, from `requirements/container-cpu.txt`. Embedding, manifold fitting/scoring and Stage 3 sampling. **Not a training image** (no wandb/tensorboard/mpi4py) and no streamlit `app` extra. |
 | `Dockerfile.xpu` | The Intel XPU variant, for Aurora single-node. Ubuntu + pip wheels. **amd64 only** — there are no arm64 Intel GPU wheels. |
-| `Dockerfile.xpu-oneapi` | Second Aurora variant, built on `intel/oneapi-hpckit` so the container's Intel MPI matches the host launcher's. Exists because multi-node collectives never complete in the `xpu` image. **amd64 only.** |
+| `Dockerfile.xpu-oneapi` | Second Aurora variant, built on `intel/oneapi` (oneAPI 2026.1) so the container's Intel MPI matches the host launcher's. Exists because multi-node collectives never complete in the `xpu` image. **amd64 only.** |
 | [`../.dockerignore`](../.dockerignore) | One ignore file for every variant (the build context is the repo root). Trims the context and keeps gitignored local files such as `configs/jobs/local.env` out of the image. |
 | `entrypoint.sh` | Optionally pulls a published GHCR weights bundle, then exec's your command. |
 | `build.sh` | `docker buildx` wrapper (variant, platform, tag, push) and the GHCR publish path (`--release`). |

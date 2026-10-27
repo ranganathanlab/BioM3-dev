@@ -55,6 +55,7 @@ import json
 import shutil
 import contextlib
 import logging
+import math
 import time
 import warnings
 import numpy as np
@@ -78,7 +79,7 @@ if BACKEND_NAME == _XPU:
     # lightning imports (from local installation)
     import lightning as pl
     from lightning import Trainer
-    from lightning.pytorch.strategies import DeepSpeedStrategy, DDPStrategy
+    from lightning.pytorch.strategies import DeepSpeedStrategy, DDPStrategy, SingleDeviceStrategy
     from lightning.pytorch.loggers import TensorBoardLogger
     from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.utilities.deepspeed import convert_zero_checkpoint_to_fp32_state_dict
@@ -90,7 +91,7 @@ else:
     # PyTorch Lightning imports
     import pytorch_lightning as pl
     from pytorch_lightning import Trainer
-    from pytorch_lightning.strategies import DeepSpeedStrategy, DDPStrategy
+    from pytorch_lightning.strategies import DeepSpeedStrategy, DDPStrategy, SingleDeviceStrategy
     from pytorch_lightning.loggers import TensorBoardLogger
     from pytorch_lightning.loggers import WandbLogger
     from pytorch_lightning.utilities.deepspeed import convert_zero_checkpoint_to_fp32_state_dict
@@ -120,6 +121,7 @@ from biom3.Stage3.callbacks import (
 from biom3.Stage3.io import prepare_model_ProteoScribe
 from biom3.core.dry_run import coerce_dry_run_output, run_dry_run
 from biom3.core.helpers import coerce_limit_batches, load_json_config
+from biom3.core.weight_sets import check_normalize_zc, merge_weight_set
 from biom3.core.run_utils import (
     backup_if_exists, collect_training_env, resolve_devices_per_node,
     setup_file_logging, teardown_file_logging, write_manifest,
@@ -227,6 +229,16 @@ def get_args(parser):
                         help='path to a curated train/val/test split manifest '
                              '(from biom3_cluster_split). When set, the random '
                              '80/20 split is bypassed and the test split is held out.')
+    parser.add_argument('--loss_positions', default='all', type=str,
+                        choices=['all', 'non_pad'],
+                        help="unsampled positions whose loss drives the gradients. 'all' "
+                             "(default) includes the padding at the tail of each sequence; "
+                             "'non_pad' counts only the sequence itself (<START>, residues, "
+                             "<END>). Either way all of loss_all, loss_non_pad and loss_pad "
+                             "are computed and logged. Predicting pads is how the model "
+                             "learns where a sequence ends, so 'non_pad' removes that signal; "
+                             "its gradients are also larger, by about the model length over "
+                             "the sequence length")
     # Conditioning blend: y = alpha * z_p + (1 - alpha) * z_c, alpha = weight on z_p
     parser.add_argument('--train_alpha', default='zc', type=str,
                         help="conditioning blend during training. 'zc' (default) "
@@ -241,6 +253,11 @@ def get_args(parser):
                              "constant ('zc', 'zp', or a number in [0, 1]) evaluates "
                              "at a single alpha. Either way it is fixed across epochs; "
                              "the 'blend' training schedule is not allowed here.")
+    parser.add_argument('--normalize_zc', default='False', type=str,
+                        help="scale the conditioning vector to unit length before the "
+                             "model sees it, after any z_p blend, in training and "
+                             "validation. Generation has to match: a model trained this "
+                             "way needs --normalize_zc in biom3_ProteoScribe_sample too")
     parser.add_argument('--zp_path', default=None, type=str,
                         help='Stage 2 Facilitator output (.pt) holding z_p row-aligned '
                              'with --primary_data_path. Required by biom3_train_stage3 '
@@ -255,6 +272,11 @@ def get_args(parser):
 
     parser.add_argument('--pretrained_weights', default='None', type=str,
                         help='path to .bin weight or checkpoint file containing model weights')
+    parser.add_argument('--weight_set', default=None, type=str,
+                        help='weight-set bundle JSON (e.g. configs/weights/run1_base.json). '
+                             'Its proteoscribe_weights fill --pretrained_weights when that '
+                             'is not given, and its record of how ProteoScribe was trained '
+                             'is checked against --normalize_zc')
     
     parser.add_argument('--scale_learning_rate', default='True', type=str,
                         help="scale the learning rate by the total number of devices "
@@ -266,7 +288,8 @@ def get_args(parser):
                         choices=['deepspeed_zero2', 'ddp'],
                         help='Lightning trainer strategy. deepspeed_zero2 (default): '
                              'DeepSpeed ZeRO Stage 2 with CPU offload. ddp: plain DDP '
-                             'with static_graph=True. Distinct from --training_strategy '
+                             'with static_graph=True, or a single-device strategy when '
+                             'there is one rank. Distinct from --training_strategy '
                              '(which selects primary_only vs combine *data* mixing).')
 
     # Finetuning
@@ -1143,8 +1166,17 @@ def apply_arg_type_conversions(args):
     args.finetune = str_to_bool(args.finetune)
     args.finetune_output_layers = str_to_bool(args.finetune_output_layers)
     args.pretrained_weights = nonestr_to_none(args.pretrained_weights)
+    args.weight_set = nonestr_to_none(getattr(args, 'weight_set', None))
+    args._weight_set_replaced = merge_weight_set(
+        args, args.weight_set, keys=("proteoscribe_weights",),
+        rename={"proteoscribe_weights": "pretrained_weights"},
+        argv=getattr(args, '_argv', None))
     args.wandb = str_to_bool(args.wandb)
     args.scale_learning_rate = parse_lr_scaling(args.scale_learning_rate)
+    args.normalize_zc = str_to_bool(args.normalize_zc)
+    if args.loss_positions not in ('all', 'non_pad'):
+        raise ValueError(
+            f"loss_positions must be 'all' or 'non_pad', got {args.loss_positions!r}")
     args.save_metrics_history = str_to_bool(args.save_metrics_history)
     args.metrics_history_all_ranks_val_loss = str_to_bool(
         args.metrics_history_all_ranks_val_loss
@@ -1219,6 +1251,69 @@ def load_data(
     return data_module
 
 
+def log_weight_set_replacements(args):
+    """Report each config path that --weight_set on the command line replaced."""
+    for attr, replaced, new in getattr(args, '_weight_set_replaced', []):
+        logger.info("--weight_set on the command line replaces the config's %s: %s -> %s",
+                    attr, replaced, new)
+
+
+def require_finetune_weights(args):
+    """Refuse to finetune a model that would start from random weights."""
+    if (args.finetune and args.pretrained_weights is None
+            and args.resume_from_checkpoint is None):
+        raise ValueError(
+            "--finetune True needs --pretrained_weights (or "
+            "--resume_from_checkpoint): without them the model would be "
+            "trained from randomly initialised weights."
+        )
+
+
+def optimizer_steps_per_epoch(num_samples, batch_size, world_size,
+                              acc_grad_batches=1, limit_train_batches=None):
+    """Optimizer steps one rank takes per epoch.
+
+    Under distributed training each rank gets ``num_samples // world_size``
+    samples (see ``_make_distributed_sampler``), the DataLoader keeps the last
+    partial batch, and Lightning steps once per ``acc_grad_batches`` batches
+    and once more at the end of the epoch for any remainder.
+    """
+    per_rank = num_samples // world_size if world_size > 1 else num_samples
+    batches = math.ceil(per_rank / batch_size)
+    limit = coerce_limit_batches(limit_train_batches)
+    if isinstance(limit, int):
+        batches = min(batches, limit)
+    elif limit is not None:
+        batches = int(batches * limit)
+    return max(1, math.ceil(batches / acc_grad_batches))
+
+
+def set_traindata_len(args, data_module):
+    """Set ``args.traindata_len``, the length of an epoch in optimizer steps.
+
+    Computed from the dataset and the world size because the dataloader has no
+    distributed sampler yet: ``torch.distributed`` is only initialized once the
+    trainer starts fitting.
+    """
+    train_loader = data_module.train_dataloader()
+    num_samples = len(train_loader.dataset)
+    batch_size = train_loader.batch_size or args.batch_size
+    world_size = args.num_nodes * args.devices_per_node
+    args.traindata_len = optimizer_steps_per_epoch(
+        num_samples=num_samples,
+        batch_size=batch_size,
+        world_size=world_size,
+        acc_grad_batches=args.acc_grad_batches,
+        limit_train_batches=getattr(args, 'limit_train_batches', None),
+    )
+    logger.info('Training samples: %s', num_samples)
+    logger.info('Numer of devices: %s', args.devices_per_node)
+    logger.info('Number of nodes: %s', args.num_nodes)
+    logger.info('Batch size: %s', batch_size)
+    logger.info('Length of a training epoch in batch gradient updates: %s',
+                args.traindata_len)
+
+
 def load_model(
     args, *,
     data_module
@@ -1243,20 +1338,10 @@ def load_model(
     Returns:
         A configured PyTorch Lightning model ready for training
     """
-    devices_per_node = args.devices_per_node
-    acc_grad_batches = args.acc_grad_batches
     diffusion_steps = args.diffusion_steps
     image_size = args.image_size
-    num_nodes = args.num_nodes
-    batch_size = args.batch_size
 
-    args.traindata_len = len(data_module.train_dataloader()) // devices_per_node // acc_grad_batches
-    logger.info('Length of dataloader: %s', len(data_module.train_dataloader()))
-    logger.info('Numer of devices: %s', devices_per_node)
-    logger.info('Number of nodes: %s', num_nodes)
-    logger.info('Batch size: %s', batch_size)
-    logger.info('Length of dataloader per device: %s', len(data_module.train_dataloader()) // devices_per_node)
-    logger.info('Length of a training epoch in batch gradient updates: %s', args.traindata_len)
+    set_traindata_len(args, data_module)
     w, h = image_size, image_size
     # Ensure diffusion steps are sufficient for data dimensions
     if diffusion_steps < int(w*h):
@@ -1704,11 +1789,19 @@ def train_model(
     # save_model handles both the sharded ZeRO checkpoint dir and the
     # single-file DDP .ckpt via the os.path.isdir() guard in
     # _convert_or_copy_checkpoint.
-    if args.distributed_strategy == 'ddp':
-        strategy = ddp_strategy
-    else:
+    if args.distributed_strategy != 'ddp':
         strategy = deepspeed_strategy
+    elif num_nodes * devices_per_node > 1:
+        strategy = ddp_strategy
+    elif args.device == 'xpu':
+        # One rank needs no process group. Explicit device, as in Stage 1:
+        # Lightning's 'auto' resolves an XPU run to a CPU root device.
+        strategy = SingleDeviceStrategy(device=torch.device('xpu'))
+    else:
+        strategy = 'auto'
     logger.info("Using distributed_strategy=%s", args.distributed_strategy)
+    if strategy is not deepspeed_strategy and strategy is not ddp_strategy:
+        logger.info("One rank: single-device strategy in place of DDP")
 
     progress_bar = getattr(args, 'progress_bar', None)
     if progress_bar is None:
@@ -1972,6 +2065,15 @@ def main(args, use_hydra=False, ds_config=None,):
         set_seed(seed)
         logger.info("Using seed: %s", seed)
 
+        require_finetune_weights(args)
+        zc_summary, zc_warning = check_normalize_zc(
+            args.weight_set, args.pretrained_weights, args.normalize_zc)
+        if get_global_rank() == 0:
+            log_weight_set_replacements(args)
+            logger.info(zc_summary)
+            for line in zc_warning:
+                logger.warning(line)
+
         # ----- Load Data -----
         data_module = load_data(
             args=args,
@@ -2026,11 +2128,7 @@ def main(args, use_hydra=False, ds_config=None,):
                     n_layers=finetune_last_n_layers,
                     finetune_output_layers=finetune_output_layers
                 )
-            elif pretrained_weights is None:
-                logger.warning("Finetuning flag --finetune set to True but "
-                               "pretrained_weights path not specified.")
-                logger.warning("Proceeding with loaded weights")
-            elif os.path.exists(pretrained_weights):
+            else:
                 PL_model = load_pretrained_weights(
                     PL_model=PL_model,
                     checkpoint_path=pretrained_weights
@@ -2042,9 +2140,6 @@ def main(args, use_hydra=False, ds_config=None,):
                     n_layers=finetune_last_n_layers,
                     finetune_output_layers=finetune_output_layers
                 )
-            else:
-                logger.warning("Pretrained checkpoint not found at %s", pretrained_weights)
-                logger.warning("Proceeding with randomly initialized weights")
         else:
             pass
 
@@ -2095,6 +2190,9 @@ def main(args, use_hydra=False, ds_config=None,):
                 completed_epochs=completed_epochs,
                 completed_steps=completed_steps,
             )
+            if get_global_rank() == 0:
+                for line in zc_warning:
+                    logger.warning(line)
             if _MAIN_START_MONOTONIC is not None:
                 total = int(time.perf_counter() - _MAIN_START_MONOTONIC)
                 h, rem = divmod(total, 3600)

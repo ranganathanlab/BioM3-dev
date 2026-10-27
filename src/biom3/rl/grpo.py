@@ -100,6 +100,9 @@ class _PromptEncoder:
     ``Stage1.preprocess.TextSeqPairing_Dataset`` (``padding='max_length'``,
     ``max_length = cfg1.text_max_length``) match Stage 1 training — see
     docs/bug_reports/bert_embedding_mismatch.md for why this matters.
+
+    The caption attention mask is passed to BERT only when
+    ``cfg1.text_attention_mask`` is set, for PenCL weights trained with it.
     """
 
     def __init__(self, s1, s2, cfg1: Namespace, device: torch.device):
@@ -107,6 +110,7 @@ class _PromptEncoder:
         self.s2 = s2
         self.cfg1 = cfg1
         self.device = device
+        self.text_attention_mask = bool(getattr(cfg1, "text_attention_mask", False))
         self._dataset = None
 
     def _build_dataset(self) -> S1prep.TextSeqPairing_Dataset:
@@ -135,7 +139,12 @@ class _PromptEncoder:
         x_t, x_p = ds[0]
         x_t = x_t.to(self.device)
         x_p = x_p.to(self.device)
-        out = self.s1(x_t, x_p, compute_masked_logits=False)
+        if self.text_attention_mask:
+            x_t_mask = ds.caption_tokenizer(batch_captions=[prompt])["attention_mask"]
+            out = self.s1(x_t, x_p, compute_masked_logits=False,
+                          x_t_mask=x_t_mask.to(self.device))
+        else:
+            out = self.s1(x_t, x_p, compute_masked_logits=False)
         z_t = out["text_joint_latent"]
         return self.s2(z_t).to(self.device)
 

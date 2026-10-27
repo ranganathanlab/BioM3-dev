@@ -137,6 +137,16 @@ class PL_ProtARDM(pl.LightningModule):
         #clone_zero_model(self.model, self.ema_model, zero_stage=3)
         ##self.ema_model = copy.deepcopy(self.model)
 
+    @property
+    def loss_positions(self) -> str:
+        """Which unsampled positions drive the gradients: 'all' or 'non_pad'."""
+        return getattr(self.script_args, 'loss_positions', 'all')
+
+    @property
+    def normalize_zc(self) -> bool:
+        """Whether the conditioning vector is scaled to unit length for the model."""
+        return bool(getattr(self.script_args, 'normalize_zc', False))
+
     def forward(
             self,
             x: torch.Tensor,
@@ -295,6 +305,8 @@ class PL_ProtARDM(pl.LightningModule):
 
             # class labels
             y_c = realization[1]#.long()
+            if self.normalize_zc:
+                y_c = F.normalize(y_c.float(), dim=-1)
 
             # input samples
             realization = realization[0]
@@ -315,6 +327,7 @@ class PL_ProtARDM(pl.LightningModule):
         else:
             loss = train_tuple[0]
             metrics = train_tuple[1]
+        loss_terms = train_tuple[2] if len(train_tuple) > 2 else {}
 
         # if realization_idx == 0:
         #     if self.global_rank == 0:
@@ -331,6 +344,8 @@ class PL_ProtARDM(pl.LightningModule):
         log_kwargs = dict(on_step=not is_val, on_epoch=True, sync_dist=is_val)
 
         self.log(f"{stage}_loss", loss, prog_bar=True, **log_kwargs)
+        for name, value in loss_terms.items():
+            self.log(f"{stage}_loss_{name}", value, **log_kwargs)
         if len(train_tuple) > 1:
             self.log(f"{stage}_prev_hard_acc",    metrics[0], prog_bar=True, **log_kwargs)
             self.log(f"{stage}_prev_soft_acc",    metrics[1], **log_kwargs)
@@ -386,6 +401,8 @@ class PL_ProtARDM(pl.LightningModule):
         #self.common_step(realization, realization_idx, stage='EMA_val')
 
     def on_fit_start(self):
+        if self.global_rank == 0:
+            logger.info("Conditioning vector scaled to unit length: %s", self.normalize_zc)
         # Diagnostic: confirm which torch.distributed backend is actually in use.
         # On Aurora frameworks/2025.3.1 this should print 'xccl'. If it prints
         # 'ccl' or 'gloo' the DeepSpeedStrategy process_group_backend kwarg
@@ -495,6 +512,12 @@ class PL_ProtARDM(pl.LightningModule):
         # compute an average loss i.e. negative average log-likelihood over the batch elements
         loss = trainer_tools.compute_average_loss_for_batch(log_prob_weighted)
 
+        # the same loss split by whether the target is padding; one of them drives the gradients
+        loss_terms = {'all': loss}
+        loss_terms.update(trainer_tools.unsampled_loss_terms(
+            log_prob, real_token_masked, real_tokens, prep.PAD_TOKEN_ID))
+        loss = loss_terms[self.loss_positions]
+
         #if 'val' in stage:
         probs = F.softmax(logits, dim=1)
         metrics = self.performance_step(
@@ -504,7 +527,7 @@ class PL_ProtARDM(pl.LightningModule):
                     probs=probs.cpu().float(),
                     conditional_prob=conditional_prob)
 
-        return loss, metrics
+        return loss, metrics, loss_terms
 
 
     @torch.no_grad()
@@ -1244,17 +1267,20 @@ class PL_ProtARDM_Finetune(PL_ProtARDM):
     tree (stored in a one-element list): its frozen parameters then stay out of
     ``self.parameters()`` (so the optimizer and DeepSpeed never see them) and out
     of saved checkpoints (rebuilt from PenCL/Facilitator weights on resume). It
-    runs in fp32 eval mode so its embeddings match Stage 1/2 inference exactly.
+    runs in fp32 eval mode, so its embeddings match Stage 1/2 inference run
+    without autocast. With ``text_attention_mask`` the batch carries the caption
+    attention mask after ``input_ids`` and the embedder passes it to BERT.
     """
 
     def __init__(self, args, model, embedder, zp_lookup=None, train_alpha=0.0,
-                 eval_alpha=EVAL_SPREAD):
+                 eval_alpha=EVAL_SPREAD, text_attention_mask=False):
         super().__init__(args=args, model=model)
         embedder.eval()
         for p in embedder.parameters():
             p.requires_grad = False
         self._embedder_ref = [embedder]
         self.zp_lookup = zp_lookup
+        self.text_attention_mask = text_attention_mask
         self.train_alpha = normalize_alpha_spec(train_alpha)
         self.eval_alpha = resolve_eval_alpha(eval_alpha)
 
@@ -1288,20 +1314,30 @@ class PL_ProtARDM_Finetune(PL_ProtARDM):
 
     def on_after_batch_transfer(self, batch, dataloader_idx):
         num_seqs, input_ids = batch[0], batch[1]
+        extras = list(batch[2:])
         embedder = self.embedder
         if next(embedder.parameters()).device != input_ids.device:
             embedder.to(input_ids.device)
         with torch.no_grad():
-            z_c = embedder(input_ids)
+            if self.text_attention_mask:
+                if not extras:
+                    raise RuntimeError(
+                        "text_attention_mask needs the caption attention mask in "
+                        "the batch; build the data module with "
+                        "text_attention_mask=True so the collate emits it."
+                    )
+                z_c = embedder(input_ids, attention_mask=extras.pop(0))
+            else:
+                z_c = embedder(input_ids)
         if self.zp_lookup is None:
             return [num_seqs, z_c]
-        if len(batch) < 3:
+        if not extras:
             raise RuntimeError(
                 "z_p blending needs the raw sequences in the batch; build the "
                 "data module with needs_unique_sequences=True so the collate "
                 "emits them."
             )
-        sequences = batch[2]
+        sequences = extras[0]
         z_p = torch.stack([self.zp_lookup[s] for s in sequences]).to(z_c)
         if self._is_training_batch():
             alpha = self._train_alpha(z_c.size(0), z_c.device)
@@ -1364,6 +1400,7 @@ class GeneralizedDataModule(pl.LightningDataModule):
         lazy=False,
         split_manifest_path=None,
         needs_unique_sequences=False,
+        text_attention_mask=False,
     ):
         super().__init__()
         self.jsonl_path = jsonl_path
@@ -1382,6 +1419,7 @@ class GeneralizedDataModule(pl.LightningDataModule):
         self.lazy = lazy
         self.split_manifest_path = split_manifest_path
         self.needs_unique_sequences = needs_unique_sequences
+        self.text_attention_mask = text_attention_mask
         self.min_seq_length = diffusion_steps - 2
 
     def setup(self, stage=None):
@@ -1405,6 +1443,7 @@ class GeneralizedDataModule(pl.LightningDataModule):
             sequence_key=self.sequence_key,
             caption_key=self.caption_key,
             include_sequences=self.needs_unique_sequences,
+            include_mask=self.text_attention_mask,
         )
 
         lengths = self._resolve_lengths(source, dataset, lengths)

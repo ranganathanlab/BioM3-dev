@@ -69,7 +69,9 @@ GRPO uses the standard `core.helpers.load_json_config` composition.
 defaults; experiment configs overlay it via `_base_configs`. Precedence
 (low → high) is `_base_configs` < current file < `_overwrite_configs` < CLI.
 
-Required fields (must end up resolved by the time the trainer starts):
+Required fields (must end up resolved by the time the trainer starts). The three weight
+paths are required: a missing path, or a file that does not populate its model, stops
+the run.
 
 | Field | What |
 |---|---|
@@ -79,6 +81,8 @@ Required fields (must end up resolved by the time the trainer starts):
 | `stage1_weights` | PenCL `.bin`/`.pt` |
 | `stage2_weights` | Facilitator `.bin`/`.pt` |
 | `stage3_init_weights` | ProteoScribe init (any supported format) |
+| `weight_set` | Optional weight-set JSON. Fills the three weights above when they are not given (and, when passed as `--weight_set` on the command line, replaces ones set in the JSON config), and its record of how PenCL was trained is checked against `text_attention_mask`. RL does not scale `z_c` to unit length, so it warns when the set records ProteoScribe as trained that way |
+| `text_attention_mask` | Pass the caption attention mask to BERT when embedding prompts (default `false`). Set it to match how the PenCL weights were trained; a mismatch with the weight set logs a loud warning |
 | `prompts_path` | UTF-8 text file, one prompt per line |
 
 GRPO hyperparameters (defaults shown):

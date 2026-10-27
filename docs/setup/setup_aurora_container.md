@@ -15,6 +15,10 @@ There are **two** Aurora images, and which one you want depends on node count:
   single node's throughput — provided the host's Cray libfabric is bound in.
   See [Multi-node](#multi-node).
 
+The multi-node image was rebuilt and re-validated, on one node and across nodes,
+after Aurora moved to `frameworks/2026.1.0` in October 2026. The single-node
+image has not been re-validated on that stack.
+
 ## Why a separate image from the CUDA one
 
 Aurora's GPUs are Intel Data Center GPU Max (Ponte Vecchio), driven by oneAPI /
@@ -25,12 +29,18 @@ CPU. The Aurora images install Intel's `+xpu` torch wheels instead, with native
 - `Dockerfile.xpu`: `torch==2.8.0+xpu`, plus `intel-extension-for-pytorch==2.8.10+xpu`,
   kept because it is part of the stack this image was validated with. The
   `addison-nm/lightning` fork no longer requires it.
-- `Dockerfile.xpu-oneapi`: `torch==2.10.0+xpu` on oneAPI 2025.3, the version under
-  Aurora's `frameworks/2025.3.1`, and no IPEX.
+- `Dockerfile.xpu-oneapi`: `torch==2.14.1+xpu` on oneAPI 2026.1, the version under
+  Aurora's `frameworks/2026.1.0`, and no IPEX.
 
-Aurora's `module load frameworks` runs a source-built torch `2.10.0a0` that a
+Aurora's `module load frameworks` runs a source-built torch `2.13.0a0` that a
 container cannot reproduce; the oneapi image matches the oneAPI version beneath it.
 See [PyTorch on Aurora](https://docs.alcf.anl.gov/aurora/data-science/frameworks/pytorch/).
+
+The image has to follow the host. When Aurora went from `frameworks/2025.3.1` to
+`2026.1.0`, which also moved Cray libfabric from 1.22.0 to 2.3.1, the oneAPI 2025.3
+image stopped completing collectives over CXI: DDP's parameter check failed on
+some ranks at start-up. Rebuilding on oneAPI 2026.1 fixed it. `module -t list`
+on a compute node shows the versions to match.
 
 ## Prerequisites
 
@@ -177,14 +187,20 @@ It needs a different image and a different launcher from the single-node path:
 | | Single node | Multi-node |
 | --- | --- | --- |
 | Image | [Dockerfile.xpu](../../docker/Dockerfile.xpu) | [Dockerfile.xpu-oneapi](../../docker/Dockerfile.xpu-oneapi) |
-| Test suite | 1134 passed / 162 skipped | 1134 passed / 162 skipped |
+| Test suite | 1134 passed / 162 skipped (before `frameworks/2026.1.0`) | 1520 passed / 2 failed / 95 skipped (`xpu-oneapi-abd9941`) |
 | Launcher | [apptainer_run.sh](../../scripts/aurora/apptainer_run.sh) — one container, torchrun spawns ranks | [apptainer_mpi_run.sh](../../scripts/aurora/apptainer_mpi_run.sh) — host mpiexec spawns one container per rank |
 | Rank source | PALS env vars translated to `RANK`/`LOCAL_RANK` | `MPIEnvironment` via mpi4py (`BIOM3_RANK_SOURCE=mpi`) |
+
+The two failures in `xpu-oneapi-abd9941` are the Stage 1 checkpoint-loading
+cases, which named a file the published test weights do not include. They now
+load `run1_base_pencl.ckpt`, which the bundle does ship, so later images should
+not show them.
 
 The oneapi image exists because the Ubuntu-based one cannot do this: its mpi4py
 is built against OpenMPI, so under Aurora's Intel MPI it never bootstraps,
 Lightning falls back to a local environment, and every rank reports global rank
-0. `intel/oneapi-hpckit` supplies an Intel MPI that matches the host launcher.
+0. Intel's oneAPI base image (`intel/oneapi`) supplies an Intel MPI that matches
+the host launcher.
 
 ```bash
 # 2 nodes, 24 tiles. Run this from the shell `qsub -I` gives you: the wrapper
@@ -196,7 +212,7 @@ SIF=/flare/NLDesignProtein/$USER/biom3_xpu-oneapi.sif    # the oneapi .sif you b
 ls -d /opt/cray/libfabric/*/lib64                         # confirm BIOM3_FABRIC_DIR below
 
 NGPU_PER_NODE=12 NGPU_TOTAL=24 BIOM3_RANK_SOURCE=mpi \
-BIOM3_FABRIC_DIR=/opt/cray/libfabric/1.22.0/lib64 BIOM3_FI_PROVIDER=cxi \
+BIOM3_FABRIC_DIR=/opt/cray/libfabric/2.3.1/lib64 BIOM3_FI_PROVIDER=cxi \
 BIOM3_IMAGE="$SIF" \
 scripts/aurora/apptainer_mpi_run.sh \
     biom3_train_stage3 --config_path configs/stage3_training/pretrain_scratch_v1.json \
@@ -230,6 +246,9 @@ Single-node containers cost roughly 8% against bare metal. Two nodes over CXI is
 number was read very early, so treat the scaling ratio as approximate until both
 are measured at the same step.
 
+These figures are from the oneAPI 2025.3 image with Cray libfabric 1.22.0 and
+have not been re-measured on the current stack.
+
 ### CXI
 
 Aurora's CXI provider is in **HPE's Cray libfabric**, not the image and not
@@ -238,8 +257,13 @@ cxi, under `/opt/aurora` as well as in the image. Point `BIOM3_FABRIC_DIR` at
 the directory holding Cray's `libfabric.so.1`:
 
 ```
-BIOM3_FABRIC_DIR=/opt/cray/libfabric/1.22.0/lib64 BIOM3_FI_PROVIDER=cxi
+BIOM3_FABRIC_DIR=/opt/cray/libfabric/2.3.1/lib64 BIOM3_FI_PROVIDER=cxi
 ```
+
+The version in that path follows Aurora's software stack (it was `1.22.0` until
+October 2026), so confirm it on a compute node with
+`ls -d /opt/cray/libfabric/*/lib64`. If the directory does not exist the wrapper
+stops at once and names `BIOM3_FABRIC_DIR`.
 
 The wrapper then binds it at `/hostfabric`, prepends it to `LD_LIBRARY_PATH`,
 `LD_PRELOAD`s it, and sets `I_MPI_OFI_LIBRARY_INTERNAL=0`. All four are needed:
@@ -262,12 +286,23 @@ and the container recipe in `_misc/sample_script.sh`.
 
 ## Troubleshooting
 
-- **`torch.xpu.device_count()` is 0.** The container's Level-Zero GPU driver
-  (`libze-intel-gpu1`, baked into the image) may not match Aurora's kernel driver.
-  Fallback: bind the host runtime instead, e.g. add the host Level-Zero libs via
-  `BIOM3_BIND_EXTRA=/usr/lib/x86_64-linux-gnu` (adjust to the actual host path) so
-  the container uses Aurora's driver. Confirm the device nodes are visible with
-  `clinfo` inside the container.
+- **`torch.xpu.device_count()` is 0.** See which Level-Zero libraries the process
+  loaded (`grep libze_ /proc/self/maps` from inside it). The loader
+  (`libze_loader.so.1`) and the GPU driver (`libze_intel_gpu.so.1`) have to come
+  from the same place: the image's loader with the host's driver finds no
+  devices. That is what happened under `apptainer_mpi_run.sh` with the oneAPI
+  2026.1 image, because the host's `/usr/lib64`, bound at `/hostevent`, sat on
+  `LD_LIBRARY_PATH` ahead of the image's own library directory; the wrapper now
+  puts the image's first. For the same reason, binding the host's driver into the
+  image is not a dependable fallback. If the image's own driver sees no devices
+  under a plain `apptainer exec`, it does not match Aurora's kernel driver and
+  the image needs a different `libze-intel-gpu1`. Confirm the device nodes are
+  visible with `clinfo` inside the container.
+- **A one-rank run with `--distributed_strategy ddp` hangs at the first training
+  step.** Seen with the oneAPI 2026.1 image built before the Stage 3 fix
+  (`xpu-oneapi-fccf427`): a one-member process group left the main thread spinning
+  in the Level-Zero driver. Stage 3 now uses a single-device strategy for one
+  rank, so images from `xpu-oneapi-abd9941` on are not affected.
 - **Dependency-conflict warning during build.** Expected — the `addison-nm/lightning`
   fork vs pyproject's pin — and harmless, same as the bare-metal Aurora install.
 - **`OSError: [Errno 30] Read-only file system` (e.g. running the test suite).**

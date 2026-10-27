@@ -45,19 +45,21 @@ Columns:
 | ------- | --- | ---- |
 | cuda | `ghcr.io/natural-machine/biom3:cuda-779859b` (amd64 + arm64; also `cuda-dev`) | `spark_*` |
 | xpu | `ghcr.io/natural-machine/biom3:xpu-779859b` (amd64; also `xpu-dev`) | `aurora_v1_*` |
-| xpu-oneapi | `ghcr.io/natural-machine/biom3:xpu-oneapi-779859b` (amd64; also `xpu-oneapi-dev`) | `aurora_v2_*` |
+| xpu-oneapi | `ghcr.io/natural-machine/biom3:xpu-oneapi-abd9941` (amd64; also `xpu-oneapi-dev`) | `aurora_v2_*` |
 
 If an image is rebuilt, update this table and re-run the affected cells.
 
 The `779859b` images are the first to carry `biom3_fetch_weights`, both test
-fixtures, and the Stage 1 XPU and empty-rank fixes. The Aurora `.sif` files must
-be rebuilt from these tags before the `aurora_*` rows mean anything:
+fixtures, and the Stage 1 XPU and empty-rank fixes. The `xpu-oneapi` image is
+newer, `abd9941`, because Aurora's software stack changed underneath it (see open
+item 16). The Aurora `.sif` files must be rebuilt from these tags before the
+`aurora_*` rows mean anything:
 
 ```bash
 apptainer build /flare/NLDesignProtein/biom3_images/biom3-xpu-779859b.sif \
     docker://ghcr.io/natural-machine/biom3:xpu-779859b
-apptainer build /flare/NLDesignProtein/biom3_images/biom3-xpu-oneapi-779859b.sif \
-    docker://ghcr.io/natural-machine/biom3:xpu-oneapi-779859b
+apptainer build /flare/NLDesignProtein/biom3_images/biom3_xpu-oneapi-abd9941.sif \
+    docker://ghcr.io/natural-machine/biom3:xpu-oneapi-abd9941
 ```
 
 ## Standard inputs
@@ -149,10 +151,10 @@ export NODES=2 DEV=12           # 1/12, 2/12, 1/1 or 2/1
 export ROW=aurora_v2_n${NODES}d${DEV}
 export NGPU_PER_NODE=$DEV NGPU_TOTAL=$((NODES * DEV))
 export BIOM3_RANK_SOURCE=mpi
-export BIOM3_IMAGE=/flare/NLDesignProtein/biom3_images/biom3-xpu-oneapi-779859b.sif
+export BIOM3_IMAGE=/flare/NLDesignProtein/biom3_images/biom3_xpu-oneapi-abd9941.sif
 export BIOM3_BIND_EXTRA=/lus
 # multi-node only: drive Slingshot rather than tcp
-[ "$NODES" -gt 1 ] && export BIOM3_FABRIC_DIR=/opt/cray/libfabric/1.22.0/lib64 \
+[ "$NODES" -gt 1 ] && export BIOM3_FABRIC_DIR=/opt/cray/libfabric/2.3.1/lib64 \
                              BIOM3_FI_PROVIDER=cxi
 R="scripts/aurora/apptainer_mpi_run.sh"
 MN="--device auto --num_nodes $NODES --devices_per_node $DEV"
@@ -299,7 +301,7 @@ Per column:
 
 | Column | Criteria |
 | ------ | -------- |
-| `emb` | `emb.PenCL_emb.pt`, `emb.Facilitator_emb.pt` and `emb.compiled_emb.hdf5` exist. The HDF5 has one row per input row. With more than 1 rank: same rows, in input order, with no duplicates. |
+| `emb` | `emb.PenCL_emb.pt`, `emb.Facilitator_emb.pt` and `emb.compiled_emb.hdf5` exist. The HDF5 has one row per input row. With more than 1 rank: same rows, in input order, with no duplicates. The log has a `PenCL: loaded 752/752 parameters` line, and the `z_t` row norms in `emb.PenCL_emb.pt` vary from row to row; if every one is 22.63 the PenCL weights did not load (see open item 17). |
 | `s1pt`, `s3pt`, `s3ft`, `s3gft` | At least one optimizer step and one validation pass, with finite training and validation loss. A checkpoint is written under `checkpoints/<row>-<column>/` and run artifacts (`args.json`, `run.log`) under `runs/<row>-<column>/`. With more than 1 node, rank 0 writes the checkpoint once. |
 | `s3ft` | The log shows the `run1_base` weights loaded with no missing or unexpected keys, and the trainable parameter count matches the finetune flags. |
 | `s3gft` | The log shows captions composed from the records and z_c computed on the device, not read from a file. |
@@ -444,3 +446,26 @@ Per column:
    (`apptainer exec --cleanenv` plus `torchrun` on the unmodified image), with only
    `CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0` affecting the outcome. Same source, same
    caveat. Worth re-testing directly, since it would simplify the `v1` row considerably.
+
+16. Aurora moved to `frameworks/2026.1.0` (oneAPI 2026.1, Cray libfabric 2.3.1) in
+   October 2026. The oneAPI 2025.3 `xpu-oneapi` images, `779859b` included, then failed
+   multi-node over CXI: DDP's parameter check reported mismatched parameter counts on
+   some ranks at start-up. The `aurora_v2_*` rows therefore use `xpu-oneapi-abd9941`,
+   built on oneAPI 2026.1, with `BIOM3_FABRIC_DIR` pointing at libfabric 2.3.1. The `xpu`
+   image behind `aurora_v1_n1d12` has not been run on the new stack.
+
+17. Stage 1 inference could embed with PenCL weights that never loaded, and report
+   nothing. **Fixed in `da524c6`.** It chose its loader from the file extension, so a
+   Lightning checkpoint named `.bin` went through a non-strict load in which no key
+   matched, and the run embedded with an untrained projection head. The sign is every
+   `z_t` row norm equal to 22.63 (√512). The loader now reads the format from the file
+   and stops the run if any parameter is left unloaded. The fix is in `src/`, so images
+   built before it, `xpu-oneapi-abd9941` included, still have the bug.
+
+   An `emb` output made from such a file is invalid. On Aurora that covers
+   `outputs/validation/au1-emb`, `au2-emb` and `au2-emb.pre-4ea2435`, which read a
+   checkout whose `weights/PenCL/run1_base_pencl.bin` was a Lightning checkpoint under a
+   `.bin` name. With the fix such a file loads correctly: its embeddings match the
+   published `run1_base` weights to 2e-6. That checkout's file was replaced with the
+   published one on 2026-10-06; `biom3_fetch_weights run1_base -o weights --dry_run`
+   reports whether a weights tree matches the published bundle.

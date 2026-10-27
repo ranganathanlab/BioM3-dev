@@ -176,7 +176,9 @@ The primary config example is `configs/stage3_training/pretrain_scratch_v2.json`
 | `batch_size` | `16` | Mini-batch size per device |
 | `lr` | `3e-4` | Base learning rate |
 | `scale_learning_rate` | `true` | Multiply LR by `num_nodes * devices_per_node` |
-| `scheduler_gamma` | `null` | LR scheduler (`"coswarmup"` or a float gamma for StepLR) |
+| `normalize_zc` | `false` | Scale the conditioning vector to unit length before the model sees it, after any `z_p` blend. Generation must then use `--normalize_zc` too, or the model is conditioned on vectors of a length it was not trained on |
+| `loss_positions` | `"all"` | Which unsampled positions drive the gradients: `"all"`, or `"non_pad"` for the sequence without its padding. See [Loss terms and padding](#loss-terms-and-padding) |
+| `scheduler_gamma` | `null` | LR scheduler (`"coswarmup"` or a float gamma for StepLR). `coswarmup` warms up over the first epoch and decays over `epochs`, counting the optimizer steps one rank takes per epoch on `num_nodes * devices_per_node` ranks |
 | `warmup_steps` | `500` | LR warmup steps (for cosine warmup scheduler) |
 | `weight_decay` | `1e-6` | AdamW weight decay |
 | `precision` | `"no"` | Training precision (`"bf16"`, `"fp16"`, `"32"`, `"no"`) |
@@ -360,7 +362,10 @@ All metrics are logged with `on_step=True, on_epoch=True`. The `{stage}` prefix 
 
 | Metric | Description |
 |---|---|
-| `{stage}_loss` | Cross-entropy loss over diffusion denoising |
+| `{stage}_loss` | The loss that drives the gradients: `{stage}_loss_all` or `{stage}_loss_non_pad`, as `loss_positions` selects |
+| `{stage}_loss_all` | Cross-entropy over every unsampled position, padding included |
+| `{stage}_loss_non_pad` | The same over unsampled positions whose true token is not padding |
+| `{stage}_loss_pad` | The same over unsampled positions whose true token is padding |
 | `{stage}_prev_hard_acc` | Hard accuracy on previously unmasked positions |
 | `{stage}_prev_soft_acc` | Soft accuracy on previously unmasked positions |
 | `{stage}_fut_hard_acc` | Hard accuracy on future (still masked) positions |
@@ -374,6 +379,82 @@ All metrics are logged with `on_step=True, on_epoch=True`. The `{stage}` prefix 
 | `{stage}_gpu_memory_usage` | GPU memory allocated (bytes) |
 | `train_grad_norm` | Global L2 gradient norm (train only, step-level) |
 | `lr-AdamW` | Current learning rate (from `LearningRateMonitor`) |
+
+### Loss terms and padding
+
+Every sequence is padded at its tail with pad tokens up to the model's fixed length, so
+most positions of a typical protein are padding. The loss is computed three ways on every
+step and all three are logged: over all unsampled positions, over the non-pad ones (the
+`<START>`, residue and `<END>` tokens) and over the pad ones.
+
+The diffusion time and the unmasking order are drawn over the whole fixed-length window, so
+some of the positions to predict fall in the padding, and how many fall on the sequence
+depends on its length and on the draw. `loss_non_pad` therefore divides each sequence's
+summed negative log-probability by the number of non-pad positions that sequence actually
+had to predict, not by anything derived from the diffusion time, and averages over the
+sequences that had any; `loss_pad` does the same for pad positions. A model that charges
+the same for every token reports that cost whatever the sequence length. `loss_all` keeps
+its original normalisation, the number of unsampled positions in the window plus one.
+
+Padding is a property of the target, not of the input. The mask token marks the positions
+the model has not been shown; a pad that has already been sampled is context and is in none
+of the three terms.
+
+`loss_positions` chooses which term drives the gradients, and that term is also what
+`{stage}_loss` reports, so `val_loss` and best-checkpoint selection follow it. Values of
+`val_loss` are therefore not comparable between runs with different `loss_positions`; use
+the explicit terms for that.
+
+Generation decodes a sequence by dropping the special tokens from all positions, so the
+length of a generated protein is set by where the model emits pad tokens. With
+`loss_positions: "non_pad"` nothing in the gradients asks the model to predict padding. In
+the one comparison run so far, a finetune of `run1_base` on 1,024 Swiss-Prot proteins (832
+steps, one seed, everything else equal), `loss_pad` rose about tenfold with `"non_pad"` and
+did not move with `"all"`, and sequences generated for a 72-residue protein's prompt
+averaged 326 residues against 81. That is one short run, not a settled result; `loss_pad`
+is logged so the effect can be watched in any run.
+
+The non-pad term is also about as many times larger than `loss_all` as the model's length
+is longer than the sequence (4.6 times in that test, in the gradient norm too), so with
+`"non_pad"` the same learning rate acts correspondingly larger.
+
+With the default `"all"`, `loss_non_pad` is still logged at every step and recorded in the
+metrics history, so the sequence-only loss can be followed over training. It is not used
+for checkpoint selection unless it is added to `checkpoint_monitors`.
+
+### Normalising the conditioning vector
+
+`normalize_zc` (default `false`) divides the conditioning vector by its length just before
+the model sees it, in training and validation. It applies to the vector that conditions the
+model, so after any `z_p` blend, and it works the same whether `z_c` is read from an HDF5
+file or computed on the device.
+
+A model trained this way has to be generated from the same way: pass `--normalize_zc` to
+`biom3_ProteoScribe_sample`, or to `biom3_embedding_pipeline --generate`, which hands it on.
+The weights themselves do not say how they were trained, so a weight set can record it:
+
+```json
+{
+    "proteoscribe_weights": "./weights/ProteoScribe/my_model.bin",
+    "proteoscribe_trained_with_normalized_zc": true
+}
+```
+
+The flag always decides what a run does. When it disagrees with the record, the run logs a
+`Z_C NORMALISATION DOES NOT MATCH THE WEIGHTS` warning at the start and again at the end.
+The check runs in `biom3_train_stage3` and `biom3_finetune_stage3` (against the weights the
+run starts from), in `biom3_ProteoScribe_sample` (given `--weight_set`), and in the
+pipeline's `--generate`. It needs a weight set that names the ProteoScribe file in use;
+without one nothing is checked. A model you train with `normalize_zc` is a new set of
+weights, so it is covered only once a weight set names it and records `true`.
+
+Which weights a run starts from follows the usual precedence. A path given on the command
+line wins. `--weight_set` on the command line comes next and replaces a `pretrained_weights`
+set in the JSON config; the run log says so. A weight set named inside the config only fills
+paths the config leaves unset.
+
+RL post-training and the multidomain scripts do not normalise. RL warns when its weight set
+says the ProteoScribe weights were trained with normalised vectors.
 
 ### sync_dist behavior
 

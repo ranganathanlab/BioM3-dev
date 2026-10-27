@@ -44,6 +44,11 @@ from biom3.core.helpers import load_json_config, convert_to_namespace
 from biom3.core.dry_run import run_dry_run
 from biom3.core.run_utils import setup_file_logging, teardown_file_logging
 from biom3.core.distributed import get_global_rank
+from biom3.core.weight_sets import (
+    check_normalize_zc,
+    check_text_attention_mask,
+    merge_weight_set,
+)
 from biom3.backend.device import (
     print_gpu_initialization, setup_logger, set_float32_matmul_precision,
     resolve_device, check_devices_per_node,
@@ -85,11 +90,21 @@ def get_finetune_args(parser):
     parser.add_argument('--stage1_config_path', default=None, type=str,
                         help='PenCL (Stage 1) inference config for the text encoder')
     parser.add_argument('--stage2_config_path', default=None, type=str,
-                        help='Facilitator (Stage 2) inference config')
+                        help='Facilitator (Stage 2) inference config; not needed '
+                             'with --use_facilitator False')
     parser.add_argument('--pencl_weights', default=None, type=str,
                         help='PenCL weights (.bin/.pt/.ckpt); only text branch is used')
     parser.add_argument('--facilitator_weights', default=None, type=str,
                         help='Facilitator weights (.bin/.pt/.ckpt)')
+    parser.add_argument('--use_facilitator', default='True', type=str,
+                        help='map z_t to z_c through the Facilitator. Set it to '
+                             'match how ProteoScribe was pretrained: False '
+                             'conditions on the raw z_t and needs neither '
+                             '--stage2_config_path nor --facilitator_weights')
+    parser.add_argument('--text_attention_mask', default='False', type=str,
+                        help='pass the caption attention mask to BERT in the frozen '
+                             'text->z_c embedder. Set it to match how the PenCL '
+                             'weights were trained: False (default) for run1_base')
 
     # LoRA finetuning — an alternative to block-freezing. When enabled the base
     # is fully frozen and low-rank adapters are trained on the attention Q/V
@@ -149,6 +164,15 @@ def _apply_finetune_arg_conversions(args):
     args.facilitator_weights = base.nonestr_to_none(args.facilitator_weights)
     args.stage1_config_path = base.nonestr_to_none(args.stage1_config_path)
     args.stage2_config_path = base.nonestr_to_none(args.stage2_config_path)
+    args.text_attention_mask = base.str_to_bool(args.text_attention_mask)
+    args.use_facilitator = base.str_to_bool(args.use_facilitator)
+    # --weight_set is a shared argument; the base conversions fill pretrained_weights.
+    # Without a Facilitator its weights are not a key of this run, so a bundle that
+    # carries one must not fill them in behind the flag.
+    weight_keys = ("pencl_weights", "facilitator_weights") if args.use_facilitator \
+        else ("pencl_weights",)
+    args._weight_set_replaced += merge_weight_set(
+        args, args.weight_set, keys=weight_keys, argv=args._argv)
 
     schema = args.record_schema
     if isinstance(schema, str):
@@ -197,13 +221,21 @@ def parse_arguments(argv):
 
 
 def load_embedder_configs(args):
-    if args.stage1_config_path is None or args.stage2_config_path is None:
+    if args.stage1_config_path is None:
         raise ValueError(
-            "Both --stage1_config_path and --stage2_config_path are required for "
-            "finetuning (they configure the frozen text->z_c embedder)."
+            "--stage1_config_path is required for finetuning (it configures the "
+            "frozen text->z_c embedder)."
+        )
+    if args.use_facilitator and args.stage2_config_path is None:
+        raise ValueError(
+            "--stage2_config_path is required for finetuning (it configures the "
+            "Facilitator). Pass --use_facilitator False if ProteoScribe was "
+            "pretrained on raw z_t."
         )
     stage1_args = convert_to_namespace(load_json_config(args.stage1_config_path))
-    stage2_args = convert_to_namespace(load_json_config(args.stage2_config_path))
+    stage2_args = None
+    if args.use_facilitator:
+        stage2_args = convert_to_namespace(load_json_config(args.stage2_config_path))
     return stage1_args, stage2_args
 
 
@@ -227,23 +259,26 @@ def load_data(args, stage1_args):
         lazy=args.lazy_records,
         split_manifest_path=args.split_manifest_path,
         needs_unique_sequences=PL_mod.alpha_spec_uses_zp(args.train_alpha),
+        text_attention_mask=args.text_attention_mask,
     )
     data_module.setup()
     return data_module
 
 
 def load_model(args, data_module, stage1_args, stage2_args):
-    args.traindata_len = (
-        len(data_module.train_dataloader()) // args.devices_per_node // args.acc_grad_batches
-    )
-    logger.info('Length of a training epoch in batch gradient updates: %s',
-                args.traindata_len)
+    base.set_traindata_len(args, data_module)
 
-    if stage2_args.emb_dim != args.text_emb_dim:
+    # Whatever produces z_c last has to match ProteoScribe's conditioning MLP:
+    # the Facilitator when there is one, otherwise PenCL's projection head.
+    if args.use_facilitator:
+        zc_dim, zc_source = stage2_args.emb_dim, "Facilitator output dim"
+    else:
+        zc_dim, zc_source = stage1_args.proj_embedding_dim, "PenCL z_t dim"
+    if zc_dim != args.text_emb_dim:
         raise ValueError(
-            f"Facilitator output dim ({stage2_args.emb_dim}) != ProteoScribe "
-            f"text_emb_dim ({args.text_emb_dim}); z_c would not match the "
-            f"conditioning MLP. Align the configs."
+            f"{zc_source} ({zc_dim}) != ProteoScribe text_emb_dim "
+            f"({args.text_emb_dim}); z_c would not match the conditioning MLP. "
+            f"Align the configs."
         )
 
     if get_global_rank() == 0:
@@ -270,6 +305,7 @@ def load_model(args, data_module, stage1_args, stage2_args):
         pencl_weights=args.pencl_weights,
         facilitator_weights=args.facilitator_weights,
         device=None,
+        use_facilitator=args.use_facilitator,
     )
     zp_lookup = None
     if PL_mod.alpha_spec_uses_zp(args.train_alpha):
@@ -282,6 +318,7 @@ def load_model(args, data_module, stage1_args, stage2_args):
         zp_lookup=zp_lookup,
         train_alpha=args.train_alpha,
         eval_alpha=args.eval_alpha,
+        text_attention_mask=args.text_attention_mask,
     )
     return PL_model
 
@@ -391,6 +428,28 @@ def main(args, ds_config=None):
         logger.info("Using seed: %s", seed)
 
         stage1_args, stage2_args = load_embedder_configs(args)
+        if args.pretrained_weights is None and args.resume_from_checkpoint is None:
+            raise ValueError(
+                "--pretrained_weights is required for finetuning unless "
+                "--resume_from_checkpoint is given: without either, ProteoScribe "
+                "would be finetuned from randomly initialised weights."
+            )
+        mask_summary, mask_warning = check_text_attention_mask(
+            args.weight_set, args.pencl_weights, args.text_attention_mask)
+        zc_summary, zc_warning = check_normalize_zc(
+            args.weight_set, args.pretrained_weights, args.normalize_zc)
+        mask_warning = mask_warning + zc_warning
+        if get_global_rank() == 0:
+            base.log_weight_set_replacements(args)
+            logger.info(
+                "Conditioning vector: %s",
+                "z_c = facilitator(z_t)" if args.use_facilitator
+                else "z_c = z_t (no Facilitator)")
+            logger.info(mask_summary)
+            logger.info(zc_summary)
+            for line in mask_warning:
+                logger.warning(line)
+
         data_module = load_data(args, stage1_args=stage1_args)
         PL_model = load_model(
             args, data_module=data_module,
@@ -496,6 +555,9 @@ def main(args, ds_config=None):
                     )
                 except Exception as e:  # pragma: no cover
                     logger.warning("LoRA export failed (non-fatal): %s", e)
+            if get_global_rank() == 0:
+                for line in mask_warning:
+                    logger.warning(line)
             if base._MAIN_START_MONOTONIC is not None:
                 total = int(time.perf_counter() - base._MAIN_START_MONOTONIC)
                 h, rem = divmod(total, 3600)

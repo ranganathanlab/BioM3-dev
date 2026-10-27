@@ -67,8 +67,20 @@ elif [[ "$BIOM3_MACHINE" == aurora ]]; then
     # --- This appears to be necessary to avoid hangs, although after some 
     # --- further investigation, those "hangs" may have been actually just been
     # --- the IDE failing to refresh the log file. May not be necessary.
-    # --- Hang avoidance — pairs with CCL_OP_SYNC (already set by frameworks module).
+    # --- Hang avoidance — pairs with CCL_OP_SYNC, set just below.
     export CCL_ATL_SYNC_COLL=1
+
+    # --- Synchronous oneCCL collectives. The frameworks/2025.3.1 module exported
+    # --- this itself; frameworks/2026.1.0 (Aurora's default since 2026-10-02)
+    # --- does not. Without it, all eight 256-node Stage 1 runs on the new module
+    # --- died within 340 training steps: mostly a Level Zero abort (`ur_die:
+    # --- urEventWait must not be called for an internal event`) on a device->host
+    # --- scalar read, once a hang in MPI_Allreduce. With it, neither recurred in
+    # --- three 256-node runs (938 steps). ALCF lists both as known issues
+    # --- (https://docs.alcf.anl.gov/aurora/bugs-table/, read 2026-10-08): #156,
+    # --- the ur_die abort, fix expected in oneAPI 2026.2; and #174, a oneCCL
+    # --- async-collective hang with CCL_OP_SYNC=1 as the workaround.
+    export CCL_OP_SYNC=1
 
     # --- Pin CCL progress threads to the last core of each rank's --cpu-bind range
     # --- (see ALCF-canonical 8-cores-per-rank binding in the train scripts).

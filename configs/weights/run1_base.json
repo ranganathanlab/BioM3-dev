@@ -1,5 +1,7 @@
 {
     "pencl_weights": "./weights/PenCL/run1_base_pencl.bin",
+    "pencl_trained_with_text_attention_mask": false,
     "facilitator_weights": "./weights/Facilitator/run1_base_facilitator.bin",
-    "proteoscribe_weights": "./weights/ProteoScribe/run1_base_proteoscribe.bin"
+    "proteoscribe_weights": "./weights/ProteoScribe/run1_base_proteoscribe.bin",
+    "proteoscribe_trained_with_normalized_zc": false
 }
